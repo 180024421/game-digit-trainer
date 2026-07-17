@@ -320,29 +320,88 @@ class MainWindow(QMainWindow):
         mid_l.addWidget(self.work_hint)
 
         self.import_canvas = ImageCanvas()
-        self.import_canvas.setMinimumHeight(420)
+        self.import_canvas.setMinimumHeight(280)
         self.import_canvas.roi_changed.connect(self._on_roi_changed)
         self.import_canvas.boxes_changed.connect(self._on_boxes_changed)
         self.import_canvas.view_changed.connect(self._on_view_changed)
+        self.import_canvas.selection_changed.connect(self._on_box_selection_changed)
         mid_l.addWidget(self.import_canvas, 1)
 
         self.preview_big = QLabel("识别预览：框选数字后点「预览识别」")
         self.preview_big.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.preview_big.setMinimumHeight(56)
+        self.preview_big.setFixedHeight(44)
         self.preview_big.setStyleSheet(
-            "background:#111827; color:#fbbf24; border-radius:10px; font-size:28px; font-weight:800; padding:8px;"
+            "background:#111827; color:#fbbf24; border-radius:10px; font-size:22px; font-weight:800; padding:4px;"
         )
         mid_l.addWidget(self.preview_big)
+
+        # 选中字框：单行紧凑（避免再挤掉画布高度导致截图顶部被裁）
+        sel_bar = QHBoxLayout()
+        sel_bar.setContentsMargins(0, 0, 0, 0)
+        self.selected_crop_preview = QLabel("未选")
+        self.selected_crop_preview.setFixedSize(56, 56)
+        self.selected_crop_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.selected_crop_preview.setStyleSheet(
+            "background:#0b1220; color:#94a3b8; border:2px solid #64748b; "
+            "border-radius:6px; font-size:11px;"
+        )
+        self.selected_crop_preview.setToolTip("当前选中字框放大预览")
+        sel_bar.addWidget(self.selected_crop_preview)
+        self.selected_box_label = QLabel("点绿框选中后可改宽高")
+        self.selected_box_label.setObjectName("hintLabel")
+        sel_bar.addWidget(self.selected_box_label)
+        sel_bar.addWidget(QLabel("宽"))
+        self.box_w_spin = QSpinBox()
+        self.box_w_spin.setRange(2, 400)
+        self.box_w_spin.setEnabled(False)
+        self.box_w_spin.setFixedWidth(64)
+        self.box_w_spin.setToolTip("精确调整选中字框宽度（像素）")
+        self.box_w_spin.valueChanged.connect(self._on_box_size_spin)
+        sel_bar.addWidget(self.box_w_spin)
+        btn_w_minus = QPushButton("窄")
+        btn_w_minus.setFixedWidth(32)
+        btn_w_minus.clicked.connect(lambda: self._nudge_selected_size(dw=-1))
+        btn_w_plus = QPushButton("宽+")
+        btn_w_plus.setFixedWidth(36)
+        btn_w_plus.clicked.connect(lambda: self._nudge_selected_size(dw=1))
+        sel_bar.addWidget(btn_w_minus)
+        sel_bar.addWidget(btn_w_plus)
+        sel_bar.addWidget(QLabel("高"))
+        self.box_h_spin = QSpinBox()
+        self.box_h_spin.setRange(2, 400)
+        self.box_h_spin.setEnabled(False)
+        self.box_h_spin.setFixedWidth(64)
+        self.box_h_spin.setToolTip("精确调整选中字框高度（像素）")
+        self.box_h_spin.valueChanged.connect(self._on_box_size_spin)
+        sel_bar.addWidget(self.box_h_spin)
+        btn_h_minus = QPushButton("矮")
+        btn_h_minus.setFixedWidth(32)
+        btn_h_minus.clicked.connect(lambda: self._nudge_selected_size(dh=-1))
+        btn_h_plus = QPushButton("高+")
+        btn_h_plus.setFixedWidth(36)
+        btn_h_plus.clicked.connect(lambda: self._nudge_selected_size(dh=1))
+        sel_bar.addWidget(btn_h_minus)
+        sel_bar.addWidget(btn_h_plus)
+        sel_bar.addStretch()
+        mid_l.addLayout(sel_bar)
+        self._syncing_box_spins = False
 
         main_tools = QHBoxLayout()
         btn_auto = QPushButton("自动预览切字")
         btn_auto.clicked.connect(self._auto_preview_boxes)
+        main_tools.addWidget(QLabel("间距"))
+        self.gap_spin = QSpinBox()
+        self.gap_spin.setRange(1, 30)
+        self.gap_spin.setValue(3)
+        self.gap_spin.setToolTip("自动切字间距：切碎了调大，粘连了调小（改完会立刻重切）")
+        self.gap_spin.valueChanged.connect(self._on_gap_changed)
+        main_tools.addWidget(self.gap_spin)
         btn_preview = QPushButton("预览识别")
         btn_preview.setObjectName("primaryBtn")
         btn_preview.setToolTip("对当前绿框跑模型，图上叠字 + 下方大号结果")
         btn_preview.clicked.connect(self._preview_recognize)
         btn_split = QPushButton("拆粘连")
-        btn_split.setToolTip("把选中的绿框左右拆成两个")
+        btn_split.setToolTip("点选绿框后拆开；未选中时自动拆最宽的框")
         btn_split.clicked.connect(self._split_selected_box)
         btn_multi = QPushButton("多ROI刷样")
         btn_multi.setToolTip("ADB截图后对所有ROI预设依次切字进待审")
@@ -421,18 +480,12 @@ class MainWindow(QMainWindow):
         self.binarize_combo = QComboBox()
         self.binarize_combo.addItems(["otsu", "adaptive", "none"])
         self.binarize_combo.currentTextChanged.connect(lambda _: self._refresh_import_preview())
-        self.gap_spin = QSpinBox()
-        self.gap_spin.setRange(1, 20)
-        self.gap_spin.setValue(3)
-        self.gap_spin.valueChanged.connect(lambda _: self._refresh_import_preview())
         btn_clear_roi = QPushButton("取消蓝框")
         btn_clear_roi.clicked.connect(self._clear_roi)
         tools.addWidget(self.chk_show_binary)
         tools.addWidget(self.chk_invert)
         tools.addWidget(QLabel("二值化"))
         tools.addWidget(self.binarize_combo)
-        tools.addWidget(QLabel("间距"))
-        tools.addWidget(self.gap_spin)
         tools.addWidget(btn_clear_roi)
         tools.addStretch()
         more_l.addLayout(tools)
@@ -1129,8 +1182,83 @@ class MainWindow(QMainWindow):
         if hasattr(self, "preview_big"):
             self.preview_big.setText("识别预览：框好后点「预览识别」或稍等自动预览")
         self._status.showMessage(f"已手动框 {len(boxes)} 个字 — Enter 切字 · 可点预览识别")
+        self._refresh_selected_box_ui()
         if boxes and self.project and latest_checkpoint(self.project):
             self._preview_timer.start(450)
+
+    def _on_box_selection_changed(self, _index: int = -1) -> None:
+        self._refresh_selected_box_ui()
+
+    def _refresh_selected_box_ui(self) -> None:
+        if not hasattr(self, "selected_crop_preview"):
+            return
+        box = self.import_canvas.selected_box()
+        idx = self.import_canvas.selected_box_index()
+        if box is None or not self._current_import:
+            self.selected_crop_preview.clear()
+            self.selected_crop_preview.setText("未选")
+            self.selected_crop_preview.setStyleSheet(
+                "background:#0b1220; color:#94a3b8; border:2px solid #64748b; "
+                "border-radius:6px; font-size:11px;"
+            )
+            self.selected_box_label.setText("点绿框选中后可改宽高")
+            self._syncing_box_spins = True
+            self.box_w_spin.setEnabled(False)
+            self.box_h_spin.setEnabled(False)
+            self._syncing_box_spins = False
+            return
+        x, y, w, h = box
+        self._syncing_box_spins = True
+        self.box_w_spin.setEnabled(True)
+        self.box_h_spin.setEnabled(True)
+        self.box_w_spin.setValue(int(w))
+        self.box_h_spin.setValue(int(h))
+        self._syncing_box_spins = False
+        self.selected_box_label.setText(f"第{idx + 1}框 {w}×{h}")
+        self.selected_crop_preview.setStyleSheet(
+            "background:#0b1220; color:#fff; border:2px solid #ef4444; "
+            "border-radius:6px; font-size:11px;"
+        )
+        try:
+            bgr = load_bgr(self._current_import)
+            crop = crop_bgr(bgr, (x, y, w, h))
+            if crop is None or crop.size == 0:
+                self.selected_crop_preview.setText("空")
+                return
+            pix = numpy_to_pixmap(crop).scaled(
+                52,
+                52,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.FastTransformation,
+            )
+            self.selected_crop_preview.setPixmap(pix)
+            self.selected_crop_preview.setText("")
+        except Exception:
+            self.selected_crop_preview.setText("失败")
+
+    def _on_box_size_spin(self, _value: int = 0) -> None:
+        if getattr(self, "_syncing_box_spins", False):
+            return
+        if self.import_canvas.selected_box() is None:
+            return
+        ok = self.import_canvas.set_selected_box_size(
+            width=self.box_w_spin.value(),
+            height=self.box_h_spin.value(),
+        )
+        if ok:
+            self._status.showMessage(
+                f"已改选中框为 {self.box_w_spin.value()}×{self.box_h_spin.value()}px"
+            )
+
+    def _nudge_selected_size(self, dw: int = 0, dh: int = 0) -> None:
+        if self.import_canvas.selected_box() is None:
+            QMessageBox.information(self, "提示", "请先点选一个绿框（选中后变红框）")
+            return
+        if self.import_canvas.nudge_selected_box(dw=dw, dh=dh):
+            self._refresh_selected_box_ui()
+            box = self.import_canvas.selected_box()
+            if box:
+                self._status.showMessage(f"选中框现为 {box[2]}×{box[3]}px")
 
     def _update_box_count(self) -> None:
         n = len(self.import_canvas.boxes())
@@ -1152,6 +1280,12 @@ class MainWindow(QMainWindow):
         self._refresh_import_preview()
         self.zoom_label.setText("缩放 1.0x")
 
+    def _on_gap_changed(self, _value: int = 0) -> None:
+        """间距一变就重跑自动切字，并刷新二值预览。"""
+        self._refresh_import_preview()
+        if self.import_canvas.roi() or self.import_canvas.boxes():
+            self._auto_preview_boxes()
+
     def _auto_preview_boxes(self) -> None:
         """在蓝框（或整图）内自动生成绿字框。"""
         if not self.project or not self._current_import:
@@ -1168,7 +1302,10 @@ class MainWindow(QMainWindow):
             boxes = [(c.x + ox, c.y + oy, c.w, c.h) for c in crops]
             self.import_canvas.set_boxes(boxes)
             self._refresh_import_preview(keep_manual_boxes=True)
-            self._status.showMessage(f"自动预览 {len(boxes)} 个字框 — 不对就改「手动逐字框」")
+            gap = self.gap_spin.value()
+            self._status.showMessage(
+                f"自动预览 {len(boxes)} 个字框（间距={gap}）— 切碎调大间距，粘连调小；点绿框后可「拆粘连」"
+            )
         except Exception as exc:
             QMessageBox.warning(self, "自动切字失败", str(exc))
 
@@ -2164,10 +2301,18 @@ class MainWindow(QMainWindow):
             self._status.showMessage(f"识别预览：{text}")
 
     def _split_selected_box(self) -> None:
-        if not self.import_canvas.split_selected_box_vertical():
-            QMessageBox.information(self, "提示", "请先点选一个较宽的绿框，再拆粘连")
+        before = self.import_canvas.selected_box_index()
+        if not self.import_canvas.boxes():
+            QMessageBox.information(self, "提示", "还没有绿框。请先「整行蓝框」+「自动预览切字」。")
             return
-        self._status.showMessage("已拆成两个字框，可再预览识别")
+        if not self.import_canvas.split_selected_box_vertical():
+            QMessageBox.information(self, "提示", "选中的框太窄，无法再拆")
+            return
+        after = self.import_canvas.selected_box_index()
+        if before < 0:
+            self._status.showMessage(f"未选中时已自动拆最宽的框 → 现已选中第 {after + 1} 框，可继续拆")
+        else:
+            self._status.showMessage(f"已拆开第 {before + 1} 框，可继续点「拆粘连」")
         self._preview_timer.start(300)
 
     def _capture_ld_window(self) -> None:
