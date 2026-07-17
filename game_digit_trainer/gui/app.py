@@ -7,8 +7,8 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
-from PyQt6.QtGui import QKeySequence, QShortcut
+from PyQt6.QtCore import Qt, QThread, QTimer, QSize, pyqtSignal
+from PyQt6.QtGui import QIcon, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -152,9 +152,11 @@ class MainWindow(QMainWindow):
         self.project_title.setStyleSheet("color:#6b7280; margin-left:8px;")
         lay.addWidget(self.project_title, 1)
 
-        self.badge_pending = QLabel("待审 0")
-        self.badge_pending.setObjectName("badge")
+        self.badge_pending = QPushButton("待审 0")
+        self.badge_pending.setObjectName("badgeBtn")
+        self.badge_pending.setCursor(Qt.CursorShape.PointingHandCursor)
         self.badge_pending.setVisible(False)
+        self.badge_pending.clicked.connect(self._goto_review)
         lay.addWidget(self.badge_pending)
 
         self.game_id_edit = QLineEdit()
@@ -312,92 +314,121 @@ class MainWindow(QMainWindow):
     def _build_review(self) -> None:
         layout = QHBoxLayout(self.tab_review)
         layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(16)
+        layout.setSpacing(12)
 
-        left = QVBoxLayout()
-        head = QHBoxLayout()
-        self.review_meta = QLabel("无待审核")
-        self.review_meta.setObjectName("titleLabel")
-        btn_reload = QPushButton("刷新")
+        gallery = QVBoxLayout()
+        gal_head = QHBoxLayout()
+        gal_head.addWidget(QLabel('待审预览（点击选择）'))
+        btn_reload = QPushButton('刷新')
         btn_reload.clicked.connect(self._reload_pending)
-        head.addWidget(self.review_meta, 1)
-        head.addWidget(btn_reload)
-        left.addLayout(head)
+        gal_head.addWidget(btn_reload)
+        gallery.addLayout(gal_head)
 
-        self.char_view = QLabel("先去「截图切字」")
+        self.pending_list = QListWidget()
+        self.pending_list.setViewMode(QListWidget.ViewMode.IconMode)
+        self.pending_list.setIconSize(QSize(72, 72))
+        self.pending_list.setResizeMode(QListWidget.ResizeMode.Adjust)
+        self.pending_list.setMovement(QListWidget.Movement.Static)
+        self.pending_list.setSpacing(6)
+        self.pending_list.setMinimumWidth(200)
+        self.pending_list.setMaximumWidth(260)
+        self.pending_list.setWordWrap(True)
+        self.pending_list.currentRowChanged.connect(self._on_pending_selected)
+        gallery.addWidget(self.pending_list, 1)
+        layout.addLayout(gallery)
+
+        center = QVBoxLayout()
+        self.review_meta = QLabel('无待审核')
+        self.review_meta.setObjectName('titleLabel')
+        center.addWidget(self.review_meta)
+
+        self.char_view = QLabel('左侧点选待审缩略图\n或去「截图切字」')
         self.char_view.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.char_view.setMinimumSize(320, 320)
+        self.char_view.setMinimumSize(360, 360)
         self.char_view.setStyleSheet(
-            "background:#111827; color:#9ca3af; border-radius:12px; font-size:16px;"
+            'background:#111827; color:#9ca3af; border-radius:12px; font-size:16px;'
         )
-        left.addWidget(self.char_view, 1)
+        center.addWidget(self.char_view, 1)
 
         nav = QHBoxLayout()
-        btn_prev = QPushButton("← 上一张")
-        btn_next = QPushButton("下一张 →")
+        btn_prev = QPushButton('← 上一张')
+        btn_next = QPushButton('下一张 →')
         btn_prev.clicked.connect(self._prev_pending)
         btn_next.clicked.connect(self._next_pending)
         nav.addWidget(btn_prev)
         nav.addWidget(btn_next)
-        left.addLayout(nav)
-        layout.addLayout(left, 3)
+        center.addLayout(nav)
+        layout.addLayout(center, 3)
 
         right = QVBoxLayout()
-        self.pred_label_ui = QLabel("预测：—")
+        self.pred_label_ui = QLabel('预测：—')
         self.pred_label_ui.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.pred_label_ui.setStyleSheet("font-size:22px; font-weight:700; color:#059669;")
+        self.pred_label_ui.setStyleSheet('font-size:22px; font-weight:700; color:#059669;')
         right.addWidget(self.pred_label_ui)
 
-        self.btn_confirm = QPushButton("空格：确认预测")
-        self.btn_confirm.setObjectName("successBtn")
+        self.btn_confirm = QPushButton('空格：确认预测')
+        self.btn_confirm.setObjectName('successBtn')
         self.btn_confirm.setEnabled(False)
         self.btn_confirm.clicked.connect(self._confirm_prediction)
         right.addWidget(self.btn_confirm)
 
-        right.addWidget(QLabel("点数字键标注（或键盘 0-9）"))
+        right.addWidget(QLabel('点下面按钮标注当前大图（一次一个字）'))
         grid = QGridLayout()
         grid.setSpacing(8)
         for i in range(10):
             b = QPushButton(str(i))
-            b.setObjectName("digitBtn")
+            b.setObjectName('digitBtn')
+            b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
             b.clicked.connect(lambda _=False, d=str(i): self._assign(d))
             grid.addWidget(b, i // 5, i % 5)
         right.addLayout(grid)
 
-        right.addWidget(QLabel("单位 / 符号"))
+        right.addWidget(QLabel('单位 / 符号'))
         unit_row = QHBoxLayout()
-        for text, lab in [("万 W", "万"), ("亿 Y", "亿"), (",", ","), ("/", "/"), ("%", "%"), (":", ":")]:
+        for text, lab in [('万 W', '万'), ('亿 Y', '亿'), (',', ','), ('/', '/'), ('%', '%'), (':', ':')]:
             b = QPushButton(text)
-            b.setObjectName("unitBtn")
+            b.setObjectName('unitBtn')
+            b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
             b.clicked.connect(lambda _=False, d=lab: self._assign(d))
             unit_row.addWidget(b)
         right.addLayout(unit_row)
 
         act = QHBoxLayout()
-        btn_del = QPushButton("删除 Del")
-        btn_del.setObjectName("dangerBtn")
-        btn_skip = QPushButton("跳过")
+        btn_del = QPushButton('删除 Del')
+        btn_del.setObjectName('dangerBtn')
+        btn_del.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        btn_skip = QPushButton('跳过')
+        btn_skip.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         btn_del.clicked.connect(self._delete_current)
         btn_skip.clicked.connect(self._next_pending)
         act.addWidget(btn_del)
         act.addWidget(btn_skip)
         right.addLayout(act)
 
-        tip = QLabel("快捷键：0-9 · W万 · Y亿 · 空格确认 · ←→翻页 · Delete删除")
-        tip.setObjectName("hintLabel")
+        tip = QLabel('操作：左侧预览点选 → 中间看大图 → 右侧标一个字。快捷键 0-9 / W / Y / ←→ / Del')
+        tip.setObjectName('hintLabel')
         tip.setWordWrap(True)
         right.addWidget(tip)
         right.addStretch()
         layout.addLayout(right, 2)
 
-        QShortcut(QKeySequence(Qt.Key.Key_Space), self.tab_review, activated=self._confirm_prediction)
-        QShortcut(QKeySequence(Qt.Key.Key_Delete), self.tab_review, activated=self._delete_current)
-        QShortcut(QKeySequence(Qt.Key.Key_Left), self.tab_review, activated=self._prev_pending)
-        QShortcut(QKeySequence(Qt.Key.Key_Right), self.tab_review, activated=self._next_pending)
-        QShortcut(QKeySequence("W"), self.tab_review, activated=lambda: self._assign("万"))
-        QShortcut(QKeySequence("Y"), self.tab_review, activated=lambda: self._assign("亿"))
-        for d in "0123456789":
-            QShortcut(QKeySequence(d), self.tab_review, activated=lambda d=d: self._assign(d))
+        for key, handler in [
+            (Qt.Key.Key_Space, self._confirm_prediction),
+            (Qt.Key.Key_Delete, self._delete_current),
+            (Qt.Key.Key_Left, self._prev_pending),
+            (Qt.Key.Key_Right, self._next_pending),
+        ]:
+            sc = QShortcut(QKeySequence(key), self)
+            sc.setContext(Qt.ShortcutContext.WindowShortcut)
+            sc.activated.connect(lambda h=handler: self._review_only(h))
+        for d in '0123456789':
+            sc = QShortcut(QKeySequence(d), self)
+            sc.setContext(Qt.ShortcutContext.WindowShortcut)
+            sc.activated.connect(lambda d=d: self._review_only(lambda: self._assign(d)))
+        for key, lab in [('W', '万'), ('Y', '亿')]:
+            sc = QShortcut(QKeySequence(key), self)
+            sc.setContext(Qt.ShortcutContext.WindowShortcut)
+            sc.activated.connect(lambda lab=lab: self._review_only(lambda: self._assign(lab)))
 
     def _build_train(self) -> None:
         layout = QHBoxLayout(self.tab_train)
@@ -505,6 +536,14 @@ class MainWindow(QMainWindow):
         self._apply_preprocess_ui()
         self.project.save_config()
 
+    def _goto_review(self) -> None:
+        self.tabs.setCurrentIndex(self.TAB_REVIEW)
+        self._reload_pending()
+
+    def _review_only(self, fn) -> None:
+        if self.tabs.currentIndex() == self.TAB_REVIEW:
+            fn()
+
     def _update_header(self) -> None:
         if not self.project:
             self.project_title.setText("未打开项目")
@@ -512,9 +551,8 @@ class MainWindow(QMainWindow):
             return
         n = len(self.project.pending_files())
         self.project_title.setText(f"项目：{self.project.config.game_id}")
-        self.badge_pending.setText(f"待审 {n}")
+        self.badge_pending.setText(f"待审 {n}（点此标注）")
         self.badge_pending.setVisible(n > 0)
-        # tab title badge-ish
         self.tabs.setTabText(self.TAB_REVIEW, f"② 审核标注（{n}）" if n else "② 审核标注")
 
     def _try_autoload_last_project(self) -> None:
@@ -886,11 +924,44 @@ class MainWindow(QMainWindow):
         if not self.project:
             return
         self._pending = self.project.pending_files()
-        self._idx = 0
+        self._rebuild_pending_gallery()
+        if self._pending:
+            self._idx = min(self._idx, len(self._pending) - 1)
+            self.pending_list.blockSignals(True)
+            self.pending_list.setCurrentRow(self._idx)
+            self.pending_list.blockSignals(False)
+        else:
+            self._idx = 0
         self._show_current()
         self._update_header()
 
-    def _show_current(self) -> None:
+    def _rebuild_pending_gallery(self) -> None:
+        self.pending_list.blockSignals(True)
+        self.pending_list.clear()
+        for i, path in enumerate(self._pending):
+            item = QListWidgetItem(f"{i + 1}")
+            item.setData(Qt.ItemDataRole.UserRole, str(path))
+            item.setToolTip(path.name)
+            raw = np.fromfile(str(path), dtype=np.uint8)
+            img = cv2.imdecode(raw, cv2.IMREAD_GRAYSCALE)
+            if img is not None:
+                pix = numpy_to_pixmap(img).scaled(
+                    72,
+                    72,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+                item.setIcon(QIcon(pix))
+            self.pending_list.addItem(item)
+        self.pending_list.blockSignals(False)
+
+    def _on_pending_selected(self, row: int) -> None:
+        if row < 0 or row >= len(self._pending):
+            return
+        self._idx = row
+        self._show_current(sync_list=False)
+
+    def _show_current(self, sync_list: bool = True) -> None:
         self._pred_label = None
         self._pred_conf = 0.0
         if not self._pending:
@@ -898,8 +969,14 @@ class MainWindow(QMainWindow):
             self.review_meta.setText("无待审核")
             self.pred_label_ui.setText("预测：—")
             self.btn_confirm.setEnabled(False)
+            self.pending_list.clear()
             return
         self._idx = max(0, min(self._idx, len(self._pending) - 1))
+        if sync_list and self.pending_list.currentRow() != self._idx:
+            self.pending_list.blockSignals(True)
+            self.pending_list.setCurrentRow(self._idx)
+            self.pending_list.blockSignals(False)
+
         path = self._pending[self._idx]
         raw = path.read_bytes()
         img = cv2.imdecode(np.frombuffer(raw, dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
@@ -908,9 +985,14 @@ class MainWindow(QMainWindow):
             return
         pix = numpy_to_pixmap(img)
         self.char_view.setPixmap(
-            pix.scaled(300, 300, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.FastTransformation)
+            pix.scaled(
+                340,
+                340,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.FastTransformation,
+            )
         )
-        self.review_meta.setText(f"{self._idx + 1} / {len(self._pending)}")
+        self.review_meta.setText(f"当前第 {self._idx + 1} / {len(self._pending)}  ·  {path.name}")
 
         if self.project:
             ckpt = latest_checkpoint(self.project)
@@ -955,10 +1037,16 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.warning(self, "标注失败", str(exc))
             return
+        # keep index at same position (next item slides up)
         self._pending.pop(self._idx)
         if self._idx >= len(self._pending) and self._pending:
             self._idx = len(self._pending) - 1
-        self._show_current()
+        self._rebuild_pending_gallery()
+        if self._pending:
+            self.pending_list.blockSignals(True)
+            self.pending_list.setCurrentRow(self._idx)
+            self.pending_list.blockSignals(False)
+        self._show_current(sync_list=False)
         self._refresh_project_info()
         self._status.showMessage(f"已标为 {display_label(normalize_label(label))}")
 
@@ -970,7 +1058,12 @@ class MainWindow(QMainWindow):
         self._pending.pop(self._idx)
         if self._idx >= len(self._pending) and self._pending:
             self._idx = len(self._pending) - 1
-        self._show_current()
+        self._rebuild_pending_gallery()
+        if self._pending:
+            self.pending_list.blockSignals(True)
+            self.pending_list.setCurrentRow(self._idx)
+            self.pending_list.blockSignals(False)
+        self._show_current(sync_list=False)
         self._update_header()
 
     def _next_pending(self) -> None:

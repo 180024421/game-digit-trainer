@@ -141,4 +141,15 @@ QLabel#badge {
   padding: 2px 8px;
   font-weight: 700;
 }
+QPushButton#badgeBtn {
+  background: #fee2e2;
+  color: #991b1b;
+  border: 1px solid #fecaca;
+  border-radius: 10px;
+  padding: 6px 12px;
+  font-weight: 700;
+}
+QPushButton#badgeBtn:hover {
+  background: #fecaca;
+}
 """
