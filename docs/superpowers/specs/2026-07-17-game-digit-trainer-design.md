@@ -1,7 +1,7 @@
 # game-digit-trainer 设计规格
 
 日期：2026-07-17  
-状态：待用户确认  
+状态：已确认（2026-07-17）  
 方案：方案 1 — PyQt 桌面 GUI + PyTorch 小 CNN → ONNX 导出包  
 确认项：独立仓库；桌面 GUI；v1 仅训练站 + 标准导出（不改 auto-script-studio 运行时）
 
