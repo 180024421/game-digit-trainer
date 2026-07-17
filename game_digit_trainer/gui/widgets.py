@@ -28,7 +28,9 @@ class ImageCanvas(QLabel):
         super().__init__(parent)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setMinimumSize(420, 280)
-        self.setStyleSheet("background:#1a1a1a; color:#888; border:1px solid #333;")
+        self.setStyleSheet(
+            "background:#0f172a; color:#94a3b8; border:1px solid #334155; border-radius:8px;"
+        )
         self.setMouseTracking(True)
         self._src: QPixmap | None = None
         self._boxes: list[tuple[int, int, int, int]] = []
@@ -39,7 +41,7 @@ class ImageCanvas(QLabel):
         self._offset = QPoint(0, 0)
         self._enable_roi = True
         self._draw_stored_roi = True
-        self.setText("选择截图后在此预览；按住鼠标拖拽框选数字区域")
+        self.setText("截图后显示在这里\n按住鼠标拖拽，框住数字区域")
 
     def set_enable_roi(self, enabled: bool) -> None:
         self._enable_roi = enabled
@@ -51,7 +53,7 @@ class ImageCanvas(QLabel):
         self._drag_origin = None
         self._drag_current = None
         self.setPixmap(QPixmap())
-        self.setText("选择截图后在此预览；按住鼠标拖拽框选数字区域")
+        self.setText("截图后显示在这里\n按住鼠标拖拽，框住数字区域")
 
     def set_image_bgr_or_gray(
         self,

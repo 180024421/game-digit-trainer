@@ -1,18 +1,20 @@
 from __future__ import annotations
 
+import os
 import shutil
 import traceback
 from pathlib import Path
 
 import cv2
 import numpy as np
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
     QFileDialog,
+    QFrame,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
@@ -40,6 +42,7 @@ from game_digit_trainer.capture import (
 )
 from game_digit_trainer.export_onnx import export_onnx, latest_checkpoint
 from game_digit_trainer.gui.region_capture import RegionCaptureOverlay
+from game_digit_trainer.gui.theme import APP_QSS
 from game_digit_trainer.gui.widgets import ImageCanvas, numpy_to_pixmap
 from game_digit_trainer.labels import display_label, normalize_label
 from game_digit_trainer.predict import predict_pending_file
@@ -86,10 +89,16 @@ class TrainWorker(QThread):
 
 
 class MainWindow(QMainWindow):
+    """三步工作台：截图切字 → 审核标注 → 训练导出。"""
+
+    TAB_WORK = 0
+    TAB_REVIEW = 1
+    TAB_TRAIN = 2
+
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("游戏数字训练站 · game-digit-trainer")
-        self.resize(1280, 820)
+        self.setWindowTitle("游戏数字训练站")
+        self.resize(1280, 860)
         self.project: GameProject | None = None
         self._pending: list[Path] = []
         self._idx = 0
@@ -97,210 +106,197 @@ class MainWindow(QMainWindow):
         self._pred_label: str | None = None
         self._pred_conf: float = 0.0
         self._current_import: Path | None = None
+        self._region_overlay = None
 
-        tabs = QTabWidget()
-        self.setCentralWidget(tabs)
-        self.tab_project = QWidget()
-        self.tab_import = QWidget()
+        root = QWidget()
+        self.setCentralWidget(root)
+        root_l = QVBoxLayout(root)
+        root_l.setContentsMargins(12, 12, 12, 8)
+        root_l.setSpacing(10)
+
+        root_l.addWidget(self._build_top_bar())
+
+        self.tabs = QTabWidget()
+        self.tab_work = QWidget()
         self.tab_review = QWidget()
-        self.tab_dataset = QWidget()
         self.tab_train = QWidget()
-        tabs.addTab(self.tab_project, "1. 项目")
-        tabs.addTab(self.tab_import, "2. 导入切字")
-        tabs.addTab(self.tab_review, "3. 审核修正")
-        tabs.addTab(self.tab_dataset, "4. 数据集")
-        tabs.addTab(self.tab_train, "5. 训练导出")
-        self.tabs = tabs
-        tabs.currentChanged.connect(self._on_tab_changed)
+        self.tabs.addTab(self.tab_work, "① 截图切字")
+        self.tabs.addTab(self.tab_review, "② 审核标注")
+        self.tabs.addTab(self.tab_train, "③ 训练导出")
+        self.tabs.currentChanged.connect(self._on_tab_changed)
+        root_l.addWidget(self.tabs, 1)
 
-        self._build_project()
-        self._build_import()
+        self._build_work()
         self._build_review()
-        self._build_dataset()
         self._build_train()
+        self._install_global_shortcuts()
+
         self._status = self.statusBar()
-        self._status.showMessage("就绪：先新建或打开游戏项目 · 导入页可拖拽框选 ROI")
+        self._status.showMessage("先打开或新建项目，再用「框选截屏」抓取游戏数字区域")
 
-    # ---------- build tabs ----------
-    def _build_project(self) -> None:
-        layout = QVBoxLayout(self.tab_project)
-        tip = QLabel(
-            "流程：新建项目 → 框选截屏/ADB截图 → 框选数字区域切字 → 审核（空格确认）→ 训练导出"
-        )
-        tip.setWordWrap(True)
-        tip.setStyleSheet("color:#555; padding:4px;")
-        layout.addWidget(tip)
+        QTimer.singleShot(0, self._try_autoload_last_project)
 
-        row = QHBoxLayout()
+    # ---------- top bar / project ----------
+    def _build_top_bar(self) -> QWidget:
+        bar = QFrame()
+        bar.setObjectName("topBar")
+        lay = QHBoxLayout(bar)
+        lay.setContentsMargins(12, 10, 12, 10)
+
+        title = QLabel("数字训练站")
+        title.setObjectName("titleLabel")
+        lay.addWidget(title)
+
+        self.project_title = QLabel("未打开项目")
+        self.project_title.setStyleSheet("color:#6b7280; margin-left:8px;")
+        lay.addWidget(self.project_title, 1)
+
+        self.badge_pending = QLabel("待审 0")
+        self.badge_pending.setObjectName("badge")
+        self.badge_pending.setVisible(False)
+        lay.addWidget(self.badge_pending)
+
         self.game_id_edit = QLineEdit()
-        self.game_id_edit.setPlaceholderText("游戏 ID，如 mygame")
-        self.chk_symbols = QCheckBox("符号 ,/%:")
-        self.chk_units = QCheckBox("单位 万/亿")
+        self.game_id_edit.setPlaceholderText("新项目名")
+        self.game_id_edit.setMaximumWidth(140)
+        lay.addWidget(self.game_id_edit)
+
+        self.chk_units = QCheckBox("万/亿")
         self.chk_units.setChecked(True)
-        btn_new = QPushButton("新建项目")
-        btn_open = QPushButton("打开项目…")
-        btn_folder = QPushButton("打开文件夹")
-        btn_add_units = QPushButton("已有项目加万/亿")
+        self.chk_symbols = QCheckBox(",/%:")
+        lay.addWidget(self.chk_units)
+        lay.addWidget(self.chk_symbols)
+
+        btn_new = QPushButton("新建")
+        btn_open = QPushButton("打开…")
+        btn_folder = QPushButton("文件夹")
+        btn_units = QPushButton("+万/亿")
+        btn_new.setObjectName("primaryBtn")
         btn_new.clicked.connect(self._new_project)
         btn_open.clicked.connect(self._open_project_dialog)
         btn_folder.clicked.connect(self._open_project_folder)
-        btn_add_units.clicked.connect(self._add_units_to_project)
-        row.addWidget(self.game_id_edit, 2)
-        row.addWidget(self.chk_symbols)
-        row.addWidget(self.chk_units)
-        row.addWidget(btn_new)
-        row.addWidget(btn_open)
-        row.addWidget(btn_folder)
-        row.addWidget(btn_add_units)
-        layout.addLayout(row)
+        btn_units.clicked.connect(self._add_units_to_project)
+        lay.addWidget(btn_new)
+        lay.addWidget(btn_open)
+        lay.addWidget(btn_folder)
+        lay.addWidget(btn_units)
+        return bar
 
-        self.project_info = QTextEdit()
-        self.project_info.setReadOnly(True)
-        layout.addWidget(self.project_info)
-        layout.addWidget(QLabel(f"默认项目目录: {projects_root()}"))
+    def _build_work(self) -> None:
+        layout = QVBoxLayout(self.tab_work)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
 
-    def _build_import(self) -> None:
-        root = QHBoxLayout(self.tab_import)
-        splitter = QSplitter()
-        root.addWidget(splitter)
-
-        left = QWidget()
-        left_l = QVBoxLayout(left)
-        left_l.setContentsMargins(0, 0, 0, 0)
-        btn_row = QHBoxLayout()
-        btn_region = QPushButton("框选截屏")
-        btn_region.setStyleSheet("font-weight:600;")
-        btn_adb = QPushButton("ADB截图")
-        btn_paste = QPushButton("粘贴剪贴板")
-        btn_pick = QPushButton("添加文件…")
-        btn_clear = QPushButton("清空列表")
+        # Step 1 capture
+        cap = QHBoxLayout()
+        step1 = QLabel("第一步：截取画面")
+        step1.setObjectName("stepLabel")
+        cap.addWidget(step1)
+        btn_region = QPushButton("框选截屏  F2")
+        btn_region.setObjectName("primaryBtn")
+        btn_adb = QPushButton("ADB 截图")
+        btn_paste = QPushButton("粘贴")
+        btn_pick = QPushButton("打开文件…")
         btn_region.clicked.connect(self._capture_region)
         btn_adb.clicked.connect(self._capture_adb)
         btn_paste.clicked.connect(self._capture_clipboard)
         btn_pick.clicked.connect(self._pick_images)
-        btn_clear.clicked.connect(self._clear_import_list)
-        btn_row.addWidget(btn_region)
-        btn_row.addWidget(btn_adb)
-        btn_row.addWidget(btn_paste)
-        btn_row.addWidget(btn_pick)
-        btn_row.addWidget(btn_clear)
-        left_l.addLayout(btn_row)
-        self.import_list = QListWidget()
-        self.import_list.currentRowChanged.connect(self._on_import_row)
-        left_l.addWidget(self.import_list)
-        splitter.addWidget(left)
+        cap.addWidget(btn_region)
+        cap.addWidget(btn_adb)
+        cap.addWidget(btn_paste)
+        cap.addWidget(btn_pick)
+        cap.addStretch()
+        layout.addLayout(cap)
 
-        right = QWidget()
-        right_l = QVBoxLayout(right)
-        right_l.setContentsMargins(0, 0, 0, 0)
+        splitter = QSplitter()
+        layout.addWidget(splitter, 1)
+
+        # Main canvas
+        mid = QWidget()
+        mid_l = QVBoxLayout(mid)
+        mid_l.setContentsMargins(0, 0, 0, 0)
+        step2 = QLabel("第二步：在图上拖拽，框住要识别的数字（蓝框）→ 绿框对准每个字后点切字")
+        step2.setObjectName("hintLabel")
+        step2.setWordWrap(True)
+        mid_l.addWidget(step2)
+
+        self.import_canvas = ImageCanvas()
+        self.import_canvas.setMinimumHeight(420)
+        self.import_canvas.roi_changed.connect(lambda _: self._refresh_import_preview(keep_roi=True))
+        mid_l.addWidget(self.import_canvas, 1)
 
         tools = QHBoxLayout()
+        self.chk_show_binary = QCheckBox("看二值图")
+        self.chk_show_binary.setChecked(False)
+        self.chk_show_binary.stateChanged.connect(lambda _: self._refresh_import_preview())
         self.chk_invert = QCheckBox("反色")
         self.chk_invert.stateChanged.connect(lambda _: self._refresh_import_preview())
         self.binarize_combo = QComboBox()
         self.binarize_combo.addItems(["otsu", "adaptive", "none"])
         self.binarize_combo.currentTextChanged.connect(lambda _: self._refresh_import_preview())
-        self.chk_show_binary = QCheckBox("看二值图")
-        self.chk_show_binary.setChecked(True)
-        self.chk_show_binary.stateChanged.connect(lambda _: self._refresh_import_preview())
-        tools.addWidget(QLabel("二值化"))
-        tools.addWidget(self.binarize_combo)
-        tools.addWidget(self.chk_invert)
-        tools.addWidget(self.chk_show_binary)
-        tools.addWidget(QLabel("字间距阈值"))
         self.gap_spin = QSpinBox()
         self.gap_spin.setRange(1, 20)
         self.gap_spin.setValue(3)
-        self.gap_spin.setToolTip("越大越容易把粘连字拆开；太小会把一个字切碎")
+        self.gap_spin.setToolTip("字间距：粘连调大，切碎调小")
         self.gap_spin.valueChanged.connect(lambda _: self._refresh_import_preview())
+        tools.addWidget(self.chk_show_binary)
+        tools.addWidget(self.chk_invert)
+        tools.addWidget(QLabel("二值化"))
+        tools.addWidget(self.binarize_combo)
+        tools.addWidget(QLabel("间距"))
         tools.addWidget(self.gap_spin)
         tools.addStretch()
-        right_l.addLayout(tools)
-
-        self.import_canvas = ImageCanvas()
-        self.import_canvas.roi_changed.connect(lambda _: self._refresh_import_preview(keep_roi=True))
-        right_l.addWidget(self.import_canvas, 1)
-
-        actions = QHBoxLayout()
-        btn_clear_roi = QPushButton("清除框选（用整图）")
-        btn_preview = QPushButton("刷新切框预览")
-        btn_seg = QPushButton("切字 → 待审核")
-        btn_seg.setStyleSheet("font-weight:600; padding:8px 16px;")
+        btn_clear_roi = QPushButton("取消数字框")
         btn_clear_roi.clicked.connect(self._clear_roi)
-        btn_preview.clicked.connect(lambda: self._refresh_import_preview())
+        self.crop_count_label = QLabel("切出 0 字")
+        self.crop_count_label.setObjectName("hintLabel")
+        btn_seg = QPushButton("切字并去审核  →")
+        btn_seg.setObjectName("successBtn")
         btn_seg.clicked.connect(self._segment_current)
-        actions.addWidget(btn_clear_roi)
-        actions.addWidget(btn_preview)
-        actions.addStretch()
-        actions.addWidget(btn_seg)
-        right_l.addLayout(actions)
+        tools.addWidget(self.crop_count_label)
+        tools.addWidget(btn_clear_roi)
+        tools.addWidget(btn_seg)
+        mid_l.addLayout(tools)
+        splitter.addWidget(mid)
 
-        hint = QLabel(
-            "截图：框选截屏 / ADB（雷电）/ Win+Shift+S 后粘贴。然后在图上再框选数字区域，绿框对准后切字。"
-        )
-        hint.setWordWrap(True)
-        hint.setStyleSheet("color:#666;")
-        right_l.addWidget(hint)
+        # History
+        right = QWidget()
+        right.setMaximumWidth(220)
+        rl = QVBoxLayout(right)
+        rl.setContentsMargins(0, 0, 0, 0)
+        rl.addWidget(QLabel("最近截图"))
+        self.import_list = QListWidget()
+        self.import_list.currentRowChanged.connect(self._on_import_row)
+        rl.addWidget(self.import_list, 1)
+        btn_clear = QPushButton("清空列表")
+        btn_clear.clicked.connect(self._clear_import_list)
+        rl.addWidget(btn_clear)
         splitter.addWidget(right)
-        splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 3)
+        splitter.setStretchFactor(0, 5)
+        splitter.setStretchFactor(1, 1)
 
     def _build_review(self) -> None:
-        layout = QVBoxLayout(self.tab_review)
-        top = QHBoxLayout()
+        layout = QHBoxLayout(self.tab_review)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(16)
+
+        left = QVBoxLayout()
+        head = QHBoxLayout()
+        self.review_meta = QLabel("无待审核")
+        self.review_meta.setObjectName("titleLabel")
         btn_reload = QPushButton("刷新")
         btn_reload.clicked.connect(self._reload_pending)
-        self.review_meta = QLabel("无待审核")
-        self.pred_label_ui = QLabel("预测：—")
-        self.pred_label_ui.setStyleSheet("font-size:18px; font-weight:600; color:#0a7;")
-        top.addWidget(btn_reload)
-        top.addWidget(self.review_meta, 1)
-        top.addWidget(self.pred_label_ui)
-        layout.addLayout(top)
+        head.addWidget(self.review_meta, 1)
+        head.addWidget(btn_reload)
+        left.addLayout(head)
 
-        self.char_view = QLabel()
+        self.char_view = QLabel("先去「截图切字」")
         self.char_view.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.char_view.setMinimumHeight(260)
-        self.char_view.setStyleSheet("background:#111; border:1px solid #333;")
-        layout.addWidget(self.char_view)
-
-        confirm_row = QHBoxLayout()
-        self.btn_confirm = QPushButton("空格：确认预测")
-        self.btn_confirm.setStyleSheet(
-            "background:#1a7f37; color:white; font-size:16px; padding:10px; font-weight:600;"
+        self.char_view.setMinimumSize(320, 320)
+        self.char_view.setStyleSheet(
+            "background:#111827; color:#9ca3af; border-radius:12px; font-size:16px;"
         )
-        self.btn_confirm.clicked.connect(self._confirm_prediction)
-        confirm_row.addWidget(self.btn_confirm)
-        layout.addLayout(confirm_row)
-
-        grid = QGridLayout()
-        for i in range(10):
-            b = QPushButton(str(i))
-            b.setFixedHeight(44)
-            b.setShortcut(QKeySequence(str(i)))
-            b.clicked.connect(lambda _=False, d=str(i): self._assign(d))
-            grid.addWidget(b, 0, i)
-        layout.addLayout(grid)
-
-        sym_row = QHBoxLayout()
-        for text, lab in [
-            ("逗号 ,", ","),
-            ("斜杠 /", "/"),
-            ("百分号 %", "%"),
-            ("冒号 :", ":"),
-            ("万 (W)", "万"),
-            ("亿 (Y)", "亿"),
-        ]:
-            b = QPushButton(text)
-            b.clicked.connect(lambda _=False, d=lab: self._assign(d))
-            sym_row.addWidget(b)
-        btn_del = QPushButton("删除 Del")
-        btn_skip = QPushButton("跳过 →")
-        btn_del.clicked.connect(self._delete_current)
-        btn_skip.clicked.connect(self._next_pending)
-        sym_row.addWidget(btn_del)
-        sym_row.addWidget(btn_skip)
-        layout.addLayout(sym_row)
+        left.addWidget(self.char_view, 1)
 
         nav = QHBoxLayout()
         btn_prev = QPushButton("← 上一张")
@@ -309,16 +305,57 @@ class MainWindow(QMainWindow):
         btn_next.clicked.connect(self._next_pending)
         nav.addWidget(btn_prev)
         nav.addWidget(btn_next)
-        layout.addLayout(nav)
+        left.addLayout(nav)
+        layout.addLayout(left, 3)
 
-        tip = QLabel(
-            "快捷键：0-9 标注 · W=万 · Y=亿 · 空格确认预测 · ←/→ 翻页 · Delete 删除"
-        )
+        right = QVBoxLayout()
+        self.pred_label_ui = QLabel("预测：—")
+        self.pred_label_ui.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.pred_label_ui.setStyleSheet("font-size:22px; font-weight:700; color:#059669;")
+        right.addWidget(self.pred_label_ui)
+
+        self.btn_confirm = QPushButton("空格：确认预测")
+        self.btn_confirm.setObjectName("successBtn")
+        self.btn_confirm.setEnabled(False)
+        self.btn_confirm.clicked.connect(self._confirm_prediction)
+        right.addWidget(self.btn_confirm)
+
+        right.addWidget(QLabel("点数字键标注（或键盘 0-9）"))
+        grid = QGridLayout()
+        grid.setSpacing(8)
+        for i in range(10):
+            b = QPushButton(str(i))
+            b.setObjectName("digitBtn")
+            b.clicked.connect(lambda _=False, d=str(i): self._assign(d))
+            grid.addWidget(b, i // 5, i % 5)
+        right.addLayout(grid)
+
+        right.addWidget(QLabel("单位 / 符号"))
+        unit_row = QHBoxLayout()
+        for text, lab in [("万 W", "万"), ("亿 Y", "亿"), (",", ","), ("/", "/"), ("%", "%"), (":", ":")]:
+            b = QPushButton(text)
+            b.setObjectName("unitBtn")
+            b.clicked.connect(lambda _=False, d=lab: self._assign(d))
+            unit_row.addWidget(b)
+        right.addLayout(unit_row)
+
+        act = QHBoxLayout()
+        btn_del = QPushButton("删除 Del")
+        btn_del.setObjectName("dangerBtn")
+        btn_skip = QPushButton("跳过")
+        btn_del.clicked.connect(self._delete_current)
+        btn_skip.clicked.connect(self._next_pending)
+        act.addWidget(btn_del)
+        act.addWidget(btn_skip)
+        right.addLayout(act)
+
+        tip = QLabel("快捷键：0-9 · W万 · Y亿 · 空格确认 · ←→翻页 · Delete删除")
+        tip.setObjectName("hintLabel")
         tip.setWordWrap(True)
-        tip.setStyleSheet("color:#666;")
-        layout.addWidget(tip)
+        right.addWidget(tip)
+        right.addStretch()
+        layout.addLayout(right, 2)
 
-        # Window-level shortcuts that work when review tab focused
         QShortcut(QKeySequence(Qt.Key.Key_Space), self.tab_review, activated=self._confirm_prediction)
         QShortcut(QKeySequence(Qt.Key.Key_Delete), self.tab_review, activated=self._delete_current)
         QShortcut(QKeySequence(Qt.Key.Key_Left), self.tab_review, activated=self._prev_pending)
@@ -328,94 +365,96 @@ class MainWindow(QMainWindow):
         for d in "0123456789":
             QShortcut(QKeySequence(d), self.tab_review, activated=lambda d=d: self._assign(d))
 
-    def _build_dataset(self) -> None:
-        layout = QHBoxLayout(self.tab_dataset)
-        splitter = QSplitter()
-        layout.addWidget(splitter)
-
-        left = QWidget()
-        ll = QVBoxLayout(left)
-        ll.addWidget(QLabel("类别"))
-        self.ds_class_list = QListWidget()
-        self.ds_class_list.currentTextChanged.connect(self._on_ds_class)
-        ll.addWidget(self.ds_class_list)
-        btn_refresh_ds = QPushButton("刷新统计")
-        btn_refresh_ds.clicked.connect(self._reload_dataset_browser)
-        ll.addWidget(btn_refresh_ds)
-        splitter.addWidget(left)
-
-        mid = QWidget()
-        ml = QVBoxLayout(mid)
-        ml.addWidget(QLabel("样本文件"))
-        self.ds_file_list = QListWidget()
-        self.ds_file_list.currentRowChanged.connect(self._on_ds_file)
-        ml.addWidget(self.ds_file_list)
-        splitter.addWidget(mid)
-
-        right = QWidget()
-        rl = QVBoxLayout(right)
-        self.ds_preview = QLabel("选择样本预览")
-        self.ds_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.ds_preview.setMinimumSize(240, 240)
-        self.ds_preview.setStyleSheet("background:#111; border:1px solid #333;")
-        rl.addWidget(self.ds_preview)
-        move_row = QHBoxLayout()
-        move_row.addWidget(QLabel("改到"))
-        self.ds_move_combo = QComboBox()
-        btn_move = QPushButton("移动")
-        btn_del = QPushButton("删除样本")
-        btn_move.clicked.connect(self._ds_move)
-        btn_del.clicked.connect(self._ds_delete)
-        move_row.addWidget(self.ds_move_combo, 1)
-        move_row.addWidget(btn_move)
-        move_row.addWidget(btn_del)
-        rl.addLayout(move_row)
-        rl.addWidget(QLabel("发现标错的样本可在这里改类或删除，比翻文件夹快。"))
-        rl.addStretch()
-        splitter.addWidget(right)
-        splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 2)
-        splitter.setStretchFactor(2, 2)
-
     def _build_train(self) -> None:
-        layout = QVBoxLayout(self.tab_train)
+        layout = QHBoxLayout(self.tab_train)
+        layout.setContentsMargins(12, 12, 12, 12)
+
+        left = QVBoxLayout()
+        self.project_info = QTextEdit()
+        self.project_info.setReadOnly(True)
+        self.project_info.setMaximumHeight(180)
+        left.addWidget(QLabel("项目概况"))
+        left.addWidget(self.project_info)
+
         box = QGroupBox("训练")
         form = QHBoxLayout(box)
-        form.addWidget(QLabel("Epochs"))
+        form.addWidget(QLabel("轮数"))
         self.epochs_spin = QSpinBox()
         self.epochs_spin.setRange(1, 200)
         self.epochs_spin.setValue(15)
         form.addWidget(self.epochs_spin)
         btn_train = QPushButton("开始训练")
+        btn_train.setObjectName("primaryBtn")
         btn_train.clicked.connect(self._start_train)
         form.addWidget(btn_train)
         form.addStretch()
-        layout.addWidget(box)
+        left.addWidget(box)
 
         self.train_log = QTextEdit()
         self.train_log.setReadOnly(True)
-        layout.addWidget(self.train_log)
+        left.addWidget(self.train_log, 1)
 
         exp = QHBoxLayout()
-        btn_export = QPushButton("导出 ONNX 包")
+        btn_export = QPushButton("导出 ONNX")
+        btn_export.setObjectName("successBtn")
         btn_export.clicked.connect(self._export)
         btn_open_export = QPushButton("打开导出目录")
         btn_open_export.clicked.connect(self._open_export_dir)
         exp.addWidget(btn_export)
         exp.addWidget(btn_open_export)
         exp.addStretch()
-        layout.addLayout(exp)
+        left.addLayout(exp)
+        layout.addLayout(left, 2)
+
+        # dataset browser embedded
+        right = QGroupBox("样本库（改错/删除）")
+        rl = QVBoxLayout(right)
+        row = QHBoxLayout()
+        self.ds_class_list = QListWidget()
+        self.ds_class_list.setMaximumWidth(120)
+        self.ds_class_list.currentTextChanged.connect(self._on_ds_class)
+        self.ds_file_list = QListWidget()
+        self.ds_file_list.currentRowChanged.connect(self._on_ds_file)
+        row.addWidget(self.ds_class_list)
+        row.addWidget(self.ds_file_list, 1)
+        rl.addLayout(row, 1)
+
+        self.ds_preview = QLabel("选样本")
+        self.ds_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.ds_preview.setFixedHeight(140)
+        self.ds_preview.setStyleSheet("background:#111827; color:#9ca3af; border-radius:8px;")
+        rl.addWidget(self.ds_preview)
+
+        move_row = QHBoxLayout()
+        self.ds_move_combo = QComboBox()
+        btn_move = QPushButton("改到此类")
+        btn_del = QPushButton("删除")
+        btn_del.setObjectName("dangerBtn")
+        btn_move.clicked.connect(self._ds_move)
+        btn_del.clicked.connect(self._ds_delete)
+        btn_refresh = QPushButton("刷新")
+        btn_refresh.clicked.connect(self._reload_dataset_browser)
+        move_row.addWidget(self.ds_move_combo, 1)
+        move_row.addWidget(btn_move)
+        move_row.addWidget(btn_del)
+        move_row.addWidget(btn_refresh)
+        rl.addLayout(move_row)
+        layout.addWidget(right, 2)
+
+    def _install_global_shortcuts(self) -> None:
+        QShortcut(QKeySequence("F2"), self, activated=self._capture_region)
 
     # ---------- helpers ----------
     def _on_tab_changed(self, index: int) -> None:
-        if index == 2:
+        if index == self.TAB_REVIEW:
             self._reload_pending()
-        elif index == 3:
+        elif index == self.TAB_TRAIN:
+            self._refresh_project_info()
             self._reload_dataset_browser()
 
     def _require_project(self) -> GameProject | None:
         if not self.project:
-            QMessageBox.warning(self, "提示", "请先新建或打开项目")
+            QMessageBox.warning(self, "提示", "请先在顶部新建或打开项目")
             return None
         return self.project
 
@@ -432,11 +471,42 @@ class MainWindow(QMainWindow):
         self._apply_preprocess_ui()
         self.project.save_config()
 
+    def _update_header(self) -> None:
+        if not self.project:
+            self.project_title.setText("未打开项目")
+            self.badge_pending.setVisible(False)
+            return
+        n = len(self.project.pending_files())
+        self.project_title.setText(f"项目：{self.project.config.game_id}")
+        self.badge_pending.setText(f"待审 {n}")
+        self.badge_pending.setVisible(n > 0)
+        # tab title badge-ish
+        self.tabs.setTabText(self.TAB_REVIEW, f"② 审核标注（{n}）" if n else "② 审核标注")
+
+    def _try_autoload_last_project(self) -> None:
+        root = projects_root()
+        candidates = sorted(
+            [p for p in root.iterdir() if p.is_dir() and (p / "config.json").is_file()],
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        if not candidates:
+            return
+        try:
+            self.project = open_project(candidates[0])
+            self.game_id_edit.setText(self.project.config.game_id)
+            self._sync_preprocess_ui_from_project()
+            self._refresh_project_info()
+            self._update_header()
+            self._status.showMessage(f"已自动打开最近项目：{self.project.config.game_id}")
+        except Exception:
+            pass
+
     # ---------- project ----------
     def _new_project(self) -> None:
         gid = self.game_id_edit.text().strip()
         if not gid:
-            QMessageBox.warning(self, "提示", "请填写游戏 ID")
+            QMessageBox.warning(self, "提示", "请填写项目名")
             return
         try:
             self.project = create_project(
@@ -449,8 +519,9 @@ class MainWindow(QMainWindow):
             return
         self._sync_preprocess_ui_from_project()
         self._refresh_project_info()
-        self.tabs.setCurrentIndex(1)
-        self._status.showMessage(f"已创建项目 {self.project.root}")
+        self._update_header()
+        self.tabs.setCurrentIndex(self.TAB_WORK)
+        self._status.showMessage(f"已创建，直接点「框选截屏」开始")
 
     def _open_project_dialog(self) -> None:
         path = QFileDialog.getExistingDirectory(self, "选择项目目录", str(projects_root()))
@@ -466,7 +537,9 @@ class MainWindow(QMainWindow):
         self._refresh_project_info()
         self._reload_pending()
         self._reload_dataset_browser()
-        self._status.showMessage(f"已打开 {self.project.root}")
+        self._update_header()
+        self.tabs.setCurrentIndex(self.TAB_WORK)
+        self._status.showMessage(f"已打开 {self.project.config.game_id}")
 
     def _sync_preprocess_ui_from_project(self) -> None:
         if not self.project:
@@ -481,8 +554,6 @@ class MainWindow(QMainWindow):
         proj = self._require_project()
         if not proj:
             return
-        import os
-
         os.startfile(proj.root)  # noqa: S606
 
     def _refresh_project_info(self) -> None:
@@ -490,22 +561,21 @@ class MainWindow(QMainWindow):
             self.project_info.setPlainText("")
             return
         counts = self.project.class_counts()
+        total = sum(counts.values())
         lines = [
             f"路径: {self.project.root}",
-            f"游戏: {self.project.config.game_id}",
-            f"类别: {', '.join(self.project.config.classes)}",
-            f"输入尺寸: {self.project.config.input_width}x{self.project.config.input_height}",
+            f"类别: {' '.join(display_label(c) for c in self.project.config.classes)}",
+            f"已标注样本: {total} · 待审核: {len(self.project.pending_files())}",
             "",
-            "样本数:",
         ]
         for k, v in counts.items():
-            lines.append(f"  {display_label(k)} ({k}): {v}")
-        lines.append(f"待审核: {len(self.project.pending_files())}")
+            if v:
+                lines.append(f"  {display_label(k)}: {v}")
         ckpt = latest_checkpoint(self.project)
-        lines.append(f"最新模型: {ckpt.name if ckpt else '无'}")
+        lines.append(f"模型: {ckpt.parent.name if ckpt else '尚未训练'}")
         self.project_info.setPlainText("\n".join(lines))
+        self._update_header()
 
-    # ---------- import ----------
     def _add_units_to_project(self) -> None:
         proj = self._require_project()
         if not proj:
@@ -514,15 +584,11 @@ class MainWindow(QMainWindow):
         self._refresh_project_info()
         self._reload_dataset_browser()
         if added:
-            QMessageBox.information(
-                self,
-                "已添加",
-                f"已加入类别：{', '.join(display_label(x) for x in added)}\n"
-                "审核台可用「万/亿」按钮或 W/Y 键标注。",
-            )
+            QMessageBox.information(self, "已添加", "已加入「万 / 亿」，审核时用 W / Y 标注")
         else:
-            QMessageBox.information(self, "提示", "本项目已包含万/亿类别")
+            QMessageBox.information(self, "提示", "本项目已有万/亿")
 
+    # ---------- capture / import ----------
     def _capture_dest_dir(self) -> Path | None:
         proj = self._require_project()
         if not proj:
@@ -533,39 +599,44 @@ class MainWindow(QMainWindow):
     def _add_captured_path(self, path: Path) -> None:
         self.import_list.addItem(str(path))
         self.import_list.setCurrentRow(self.import_list.count() - 1)
-        self._status.showMessage(f"已截取: {path.name}")
-        self.tabs.setCurrentIndex(1)
+        self.tabs.setCurrentIndex(self.TAB_WORK)
+        self._status.showMessage(f"已截取 {path.name} — 请在图上框选数字")
 
     def _capture_region(self) -> None:
         dest = self._capture_dest_dir()
         if not dest:
             return
-        # Hide main window so it is not in the shot
         self.showMinimized()
         QApplication.processEvents()
 
-        overlay = RegionCaptureOverlay()
-        self._region_overlay = overlay  # keep ref
+        def start_overlay() -> None:
+            overlay = RegionCaptureOverlay()
+            self._region_overlay = overlay
 
-        def on_captured(qimg) -> None:
-            self.showNormal()
-            self.raise_()
-            try:
-                bgr = qimage_to_bgr(qimg)
-                from game_digit_trainer.capture import _timestamp_name
+            def on_captured(qimg) -> None:
+                self.showNormal()
+                self.raise_()
+                self.activateWindow()
+                try:
+                    from game_digit_trainer.capture import _timestamp_name
 
-                path = save_bgr(dest / _timestamp_name("region"), bgr)
-                self._add_captured_path(path)
-            except Exception as exc:
-                QMessageBox.critical(self, "截屏失败", str(exc))
+                    bgr = qimage_to_bgr(qimg)
+                    path = save_bgr(dest / _timestamp_name("region"), bgr)
+                    self._add_captured_path(path)
+                except Exception as exc:
+                    QMessageBox.critical(self, "截屏失败", str(exc))
 
-        def on_cancelled() -> None:
-            self.showNormal()
-            self.raise_()
+            def on_cancelled() -> None:
+                self.showNormal()
+                self.raise_()
+                self.activateWindow()
 
-        overlay.captured.connect(on_captured)
-        overlay.cancelled.connect(on_cancelled)
-        overlay.show()
+            overlay.captured.connect(on_captured)
+            overlay.cancelled.connect(on_cancelled)
+            overlay.show()
+
+        # brief delay so minimize finishes before grab
+        QTimer.singleShot(180, start_overlay)
 
     def _capture_adb(self) -> None:
         dest = self._capture_dest_dir()
@@ -578,21 +649,21 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(
                 self,
                 "ADB 截图失败",
-                f"{exc}\n\n提示：雷电设置里打开 ADB，或执行 adb connect 127.0.0.1:5555",
+                f"{exc}\n\n雷电：设置 → 打开 ADB，或 adb connect 127.0.0.1:5555",
             )
             return
         self._add_captured_path(path)
         if devices:
-            self._status.showMessage(f"ADB 截图成功（{devices[0]}）")
+            self._status.showMessage(f"ADB 截图成功（{devices[0]}）— 请框选数字")
 
     def _capture_clipboard(self) -> None:
         dest = self._capture_dest_dir()
         if not dest:
             return
         try:
-            bgr = capture_clipboard_bgr()
             from game_digit_trainer.capture import _timestamp_name
 
+            bgr = capture_clipboard_bgr()
             path = save_bgr(dest / _timestamp_name("clip"), bgr)
         except Exception as exc:
             QMessageBox.warning(self, "粘贴失败", str(exc))
@@ -603,17 +674,17 @@ class MainWindow(QMainWindow):
         self.import_list.clear()
         self._current_import = None
         self.import_canvas.clear_image()
+        self.crop_count_label.setText("切出 0 字")
 
     def _pick_images(self) -> None:
+        if not self._require_project():
+            return
         files, _ = QFileDialog.getOpenFileNames(
-            self,
-            "选择截图",
-            "",
-            "Images (*.png *.jpg *.jpeg *.bmp)",
+            self, "选择截图", "", "Images (*.png *.jpg *.jpeg *.bmp)"
         )
         for f in files:
             self.import_list.addItem(f)
-        if files and self.import_list.count():
+        if files:
             self.import_list.setCurrentRow(self.import_list.count() - len(files))
 
     def _on_import_row(self, row: int) -> None:
@@ -643,7 +714,6 @@ class MainWindow(QMainWindow):
             oy = roi[1] if roi else 0
             boxes = [(c.x + ox, c.y + oy, c.w, c.h) for c in crops]
             if self.chk_show_binary.isChecked():
-                # paint binary into full-size canvas for alignment with ROI
                 canvas = np.zeros(bgr.shape[:2], dtype=np.uint8)
                 if roi:
                     x, y, w, h = roi
@@ -655,7 +725,10 @@ class MainWindow(QMainWindow):
             else:
                 show = bgr
             self.import_canvas.set_image_bgr_or_gray(show, boxes, draw_stored_roi=True)
-            self._status.showMessage(f"预览切出 {len(crops)} 个字符 · ROI={roi or '整图'}")
+            self.crop_count_label.setText(f"切出 {len(crops)} 字")
+            self._status.showMessage(
+                f"绿框={len(crops)} · {'已框选数字区' if roi else '未框选则切整图'} · 调好后点「切字并去审核」"
+            )
         except Exception as exc:
             self.import_canvas.setText(str(exc))
 
@@ -664,7 +737,7 @@ class MainWindow(QMainWindow):
         if not proj:
             return
         if not self._current_import:
-            QMessageBox.warning(self, "提示", "请先在左侧选择一张截图")
+            QMessageBox.warning(self, "提示", "请先截图或打开一张图")
             return
         self._persist_preprocess()
         src = self._current_import
@@ -673,7 +746,7 @@ class MainWindow(QMainWindow):
             shutil.copy2(src, dest_raw)
         roi = self.import_canvas.roi()
         try:
-            binary, crops, sliced = segment_image(
+            _binary, crops, sliced = segment_image(
                 src,
                 proj.config.preprocess,
                 roi=roi,
@@ -682,27 +755,19 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.critical(self, "切字失败", str(exc))
             return
+        if not crops:
+            QMessageBox.warning(self, "未切出字符", "试试框更紧、开反色，或调大「间距」")
+            return
         if roi:
-            # save roi crop for reference
             ok, buf = cv2.imencode(".png", sliced)
             if ok:
                 (proj.roi_dir / f"{src.stem}_roi.png").write_bytes(buf.tobytes())
         paths = save_pending_chars(proj, src, crops)
-        self.import_canvas.set_image_bgr_or_gray(
-            binary if self.chk_show_binary.isChecked() else sliced,
-            [(c.x, c.y, c.w, c.h) for c in crops],
-            draw_stored_roi=False,
-        )
         self._reload_pending()
         self._refresh_project_info()
-        go = QMessageBox.question(
-            self,
-            "切字完成",
-            f"已切出 {len(paths)} 个字符到待审核。\n是否立刻去审核？",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        )
-        if go == QMessageBox.StandardButton.Yes:
-            self.tabs.setCurrentIndex(2)
+        self._update_header()
+        self.tabs.setCurrentIndex(self.TAB_REVIEW)
+        self._status.showMessage(f"已切出 {len(paths)} 个字，开始标注吧")
 
     # ---------- review ----------
     def _reload_pending(self) -> None:
@@ -711,12 +776,13 @@ class MainWindow(QMainWindow):
         self._pending = self.project.pending_files()
         self._idx = 0
         self._show_current()
+        self._update_header()
 
     def _show_current(self) -> None:
         self._pred_label = None
         self._pred_conf = 0.0
         if not self._pending:
-            self.char_view.setText("无待审核 — 去「导入切字」添加")
+            self.char_view.setText("没有待审核\n去「截图切字」继续")
             self.review_meta.setText("无待审核")
             self.pred_label_ui.setText("预测：—")
             self.btn_confirm.setEnabled(False)
@@ -730,16 +796,10 @@ class MainWindow(QMainWindow):
             return
         pix = numpy_to_pixmap(img)
         self.char_view.setPixmap(
-            pix.scaled(
-                240,
-                240,
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.FastTransformation,
-            )
+            pix.scaled(300, 300, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.FastTransformation)
         )
-        self.review_meta.setText(f"{self._idx + 1}/{len(self._pending)}  {path.name}")
+        self.review_meta.setText(f"{self._idx + 1} / {len(self._pending)}")
 
-        # prediction
         if self.project:
             ckpt = latest_checkpoint(self.project)
             if ckpt:
@@ -754,20 +814,20 @@ class MainWindow(QMainWindow):
                     self._pred_label = lab
                     self._pred_conf = conf
                     shown = display_label(lab)
-                    self.pred_label_ui.setText(f"预测：{shown}  ({conf:.0%})")
-                    color = "#1a7f37" if conf >= 0.8 else "#b36b00"
+                    self.pred_label_ui.setText(f"预测 {shown}  ·  {conf:.0%}")
+                    color = "#059669" if conf >= 0.8 else "#d97706"
                     self.pred_label_ui.setStyleSheet(
-                        f"font-size:18px; font-weight:600; color:{color};"
+                        f"font-size:22px; font-weight:700; color:{color};"
                     )
                     self.btn_confirm.setEnabled(True)
                     self.btn_confirm.setText(f"空格：确认「{shown}」")
                 except Exception:
-                    self.pred_label_ui.setText("预测：失败")
+                    self.pred_label_ui.setText("预测失败")
                     self.btn_confirm.setEnabled(False)
             else:
-                self.pred_label_ui.setText("预测：无模型（先标一些再训练）")
+                self.pred_label_ui.setText("尚无模型 · 先手动标一些再训练")
                 self.btn_confirm.setEnabled(False)
-                self.btn_confirm.setText("空格：确认预测（需先训练）")
+                self.btn_confirm.setText("空格确认（需先训练）")
 
     def _confirm_prediction(self) -> None:
         if self._pred_label:
@@ -799,7 +859,7 @@ class MainWindow(QMainWindow):
         if self._idx >= len(self._pending) and self._pending:
             self._idx = len(self._pending) - 1
         self._show_current()
-        self._refresh_project_info()
+        self._update_header()
 
     def _next_pending(self) -> None:
         if self._pending:
@@ -816,12 +876,12 @@ class MainWindow(QMainWindow):
         self.ds_class_list.clear()
         self.ds_file_list.clear()
         self.ds_move_combo.clear()
-        self.ds_preview.setText("选择样本预览")
+        self.ds_preview.setText("选样本")
         if not self.project:
             return
         counts = self.project.class_counts()
         for name in self.project.config.classes:
-            item = QListWidgetItem(f"{display_label(name)}  ({counts.get(name, 0)})")
+            item = QListWidgetItem(f"{display_label(name)} ({counts.get(name, 0)})")
             item.setData(Qt.ItemDataRole.UserRole, name)
             self.ds_class_list.addItem(item)
             self.ds_move_combo.addItem(display_label(name), name)
@@ -853,10 +913,7 @@ class MainWindow(QMainWindow):
             return
         self.ds_preview.setPixmap(
             numpy_to_pixmap(img).scaled(
-                220,
-                220,
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.FastTransformation,
+                120, 120, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.FastTransformation
             )
         )
 
@@ -899,16 +956,8 @@ class MainWindow(QMainWindow):
         counts = proj.class_counts()
         total = sum(counts.values())
         if total < 10:
-            QMessageBox.warning(self, "提示", f"样本太少（{total}），建议每类至少几十张再训")
+            QMessageBox.warning(self, "提示", f"样本太少（{total}），建议先多标一些")
             return
-        empty = [k for k, v in counts.items() if v == 0]
-        if empty:
-            QMessageBox.warning(
-                self,
-                "提示",
-                f"这些类还没有样本：{', '.join(display_label(x) for x in empty)}\n"
-                "可以先去掉未用符号类，或继续标注。仍将训练已有类。",
-            )
         self.train_log.clear()
         self._worker = TrainWorker(proj, self.epochs_spin.value())
         self._worker.log.connect(lambda m: self.train_log.append(m))
@@ -918,9 +967,9 @@ class MainWindow(QMainWindow):
 
     def _train_done(self, path: str) -> None:
         self.train_log.append(f"完成: {path}")
-        self._status.showMessage("训练完成 — 审核台可用空格快速确认预测")
         self._refresh_project_info()
-        QMessageBox.information(self, "完成", f"最佳模型:\n{path}\n\n回到审核台可用空格确认预测。")
+        QMessageBox.information(self, "完成", "训练完成。回审核页可用空格快速确认。")
+        self.tabs.setCurrentIndex(self.TAB_REVIEW)
 
     def _export(self) -> None:
         proj = self._require_project()
@@ -928,21 +977,19 @@ class MainWindow(QMainWindow):
             return
         ckpt = latest_checkpoint(proj)
         if not ckpt:
-            QMessageBox.warning(self, "提示", "没有 checkpoint，请先训练")
+            QMessageBox.warning(self, "提示", "请先训练")
             return
         try:
             out = export_onnx(proj, ckpt)
         except Exception as exc:
             QMessageBox.critical(self, "导出失败", f"{exc}\n{traceback.format_exc()}")
             return
-        QMessageBox.information(self, "已导出", f"导出目录:\n{out.parent}")
+        QMessageBox.information(self, "已导出", f"{out.parent}")
 
     def _open_export_dir(self) -> None:
         proj = self._require_project()
         if not proj:
             return
-        import os
-
         proj.exports_dir.mkdir(parents=True, exist_ok=True)
         os.startfile(proj.exports_dir)  # noqa: S606
 
@@ -951,6 +998,8 @@ def run_gui() -> int:
     import sys
 
     app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+    app.setStyleSheet(APP_QSS)
     win = MainWindow()
     win.show()
     return app.exec()
