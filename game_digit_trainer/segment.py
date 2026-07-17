@@ -101,6 +101,28 @@ def crop_bgr(bgr: np.ndarray, roi: tuple[int, int, int, int] | None) -> np.ndarr
     return bgr[y0:y1, x0:x1].copy()
 
 
+def crops_from_full_boxes(
+    bgr: np.ndarray,
+    boxes: list[tuple[int, int, int, int]],
+    preprocess: PreprocessConfig,
+) -> list[CharCrop]:
+    """按全图坐标的字框，切出单字（已按从左到右排序）。"""
+    ordered = sorted(boxes, key=lambda b: (b[0], b[1]))
+    out: list[CharCrop] = []
+    for x, y, w, h in ordered:
+        patch_bgr = crop_bgr(bgr, (x, y, w, h))
+        gray = apply_preprocess(patch_bgr, preprocess)
+        # ensure white digit on black
+        if float(np.mean(gray)) > 127:
+            gray = 255 - gray
+        pad = 2
+        ph, pw = gray.shape[:2]
+        canvas = np.zeros((ph + pad * 2, pw + pad * 2), dtype=np.uint8)
+        canvas[pad : pad + ph, pad : pad + pw] = gray
+        out.append(CharCrop(image=canvas, x=x, y=y, w=w, h=h))
+    return out
+
+
 def segment_image(
     path: Path,
     preprocess: PreprocessConfig,

@@ -56,6 +56,7 @@ from game_digit_trainer.project import (
 )
 from game_digit_trainer.segment import (
     crop_bgr,
+    crops_from_full_boxes,
     list_dataset_files,
     move_to_label,
     relabel_dataset_file,
@@ -215,14 +216,32 @@ class MainWindow(QMainWindow):
         mid = QWidget()
         mid_l = QVBoxLayout(mid)
         mid_l.setContentsMargins(0, 0, 0, 0)
-        step2 = QLabel("第二步：在图上拖拽，框住要识别的数字（蓝框）→ 绿框对准每个字后点切字")
-        step2.setObjectName("hintLabel")
-        step2.setWordWrap(True)
-        mid_l.addWidget(step2)
+
+        mode_row = QHBoxLayout()
+        step2 = QLabel("第二步：切字")
+        step2.setObjectName("stepLabel")
+        mode_row.addWidget(step2)
+        self.btn_mode_roi = QPushButton("① 框整行数字")
+        self.btn_mode_char = QPushButton("② 手动逐字框（推荐）")
+        self.btn_mode_char.setObjectName("primaryBtn")
+        self.btn_mode_roi.clicked.connect(lambda: self._set_cut_mode("roi"))
+        self.btn_mode_char.clicked.connect(lambda: self._set_cut_mode("char"))
+        mode_row.addWidget(self.btn_mode_roi)
+        mode_row.addWidget(self.btn_mode_char)
+        mode_row.addStretch()
+        mid_l.addLayout(mode_row)
+
+        self.work_hint = QLabel(
+            "推荐：点「手动逐字框」→ 每个数字拖一个绿框（如 2 : 0 3 共 4 个）→ 再点绿色切字"
+        )
+        self.work_hint.setObjectName("hintLabel")
+        self.work_hint.setWordWrap(True)
+        mid_l.addWidget(self.work_hint)
 
         self.import_canvas = ImageCanvas()
         self.import_canvas.setMinimumHeight(420)
-        self.import_canvas.roi_changed.connect(lambda _: self._refresh_import_preview(keep_roi=True))
+        self.import_canvas.roi_changed.connect(self._on_roi_changed)
+        self.import_canvas.boxes_changed.connect(self._on_boxes_changed)
         mid_l.addWidget(self.import_canvas, 1)
 
         tools = QHBoxLayout()
@@ -237,27 +256,42 @@ class MainWindow(QMainWindow):
         self.gap_spin = QSpinBox()
         self.gap_spin.setRange(1, 20)
         self.gap_spin.setValue(3)
-        self.gap_spin.setToolTip("字间距：粘连调大，切碎调小")
+        self.gap_spin.setToolTip("仅「框整行+自动切」时用：粘连调大，切碎调小")
         self.gap_spin.valueChanged.connect(lambda _: self._refresh_import_preview())
         tools.addWidget(self.chk_show_binary)
         tools.addWidget(self.chk_invert)
         tools.addWidget(QLabel("二值化"))
         tools.addWidget(self.binarize_combo)
-        tools.addWidget(QLabel("间距"))
+        tools.addWidget(QLabel("自动间距"))
         tools.addWidget(self.gap_spin)
-        tools.addStretch()
-        btn_clear_roi = QPushButton("取消数字框")
+
+        btn_auto = QPushButton("自动预览切字")
+        btn_auto.setToolTip("在蓝框区域内自动生成绿框（可再改成手动微调）")
+        btn_auto.clicked.connect(self._auto_preview_boxes)
+        btn_undo = QPushButton("撤销一字")
+        btn_undo.clicked.connect(self._undo_char_box)
+        btn_clear_boxes = QPushButton("清空字框")
+        btn_clear_boxes.clicked.connect(self._clear_char_boxes)
+        btn_clear_roi = QPushButton("取消蓝框")
         btn_clear_roi.clicked.connect(self._clear_roi)
-        self.crop_count_label = QLabel("切出 0 字")
+        self.crop_count_label = QLabel("字框 0")
         self.crop_count_label.setObjectName("hintLabel")
-        btn_seg = QPushButton("切字并去审核  →")
+        btn_seg = QPushButton("确认切字 → 审核")
         btn_seg.setObjectName("successBtn")
+        btn_seg.setToolTip("把当前绿框切成单字样本，进入审核标注")
         btn_seg.clicked.connect(self._segment_current)
-        tools.addWidget(self.crop_count_label)
+        tools.addWidget(btn_auto)
+        tools.addWidget(btn_undo)
+        tools.addWidget(btn_clear_boxes)
         tools.addWidget(btn_clear_roi)
+        tools.addStretch()
+        tools.addWidget(self.crop_count_label)
         tools.addWidget(btn_seg)
         mid_l.addLayout(tools)
         splitter.addWidget(mid)
+
+        # default to manual char cutting — more reliable for game fonts
+        self._set_cut_mode("char")
 
         # History
         right = QWidget()
@@ -674,7 +708,7 @@ class MainWindow(QMainWindow):
         self.import_list.clear()
         self._current_import = None
         self.import_canvas.clear_image()
-        self.crop_count_label.setText("切出 0 字")
+        self.crop_count_label.setText("字框 0")
 
     def _pick_images(self) -> None:
         if not self._require_project():
@@ -692,20 +726,67 @@ class MainWindow(QMainWindow):
             return
         self._current_import = Path(self.import_list.item(row).text())
         self.import_canvas.clear_roi()
+        self.import_canvas.clear_boxes()
+        self._refresh_import_preview()
+
+    def _set_cut_mode(self, mode: str) -> None:
+        self.import_canvas.set_mode(mode)
+        if mode == "char":
+            self.work_hint.setText(
+                "手动切字：每个字拖一个绿框（例如 2、:、0、3 共 4 个框）→ 点「确认切字 → 审核」"
+            )
+            self.btn_mode_char.setObjectName("primaryBtn")
+            self.btn_mode_roi.setObjectName("")
+        else:
+            self.work_hint.setText(
+                "区域模式：先拖蓝框框住整行数字 → 点「自动预览切字」看绿框 → 再确认切字"
+            )
+            self.btn_mode_roi.setObjectName("primaryBtn")
+            self.btn_mode_char.setObjectName("")
+        # refresh button styles
+        self.btn_mode_char.style().unpolish(self.btn_mode_char)
+        self.btn_mode_char.style().polish(self.btn_mode_char)
+        self.btn_mode_roi.style().unpolish(self.btn_mode_roi)
+        self.btn_mode_roi.style().polish(self.btn_mode_roi)
+        self._update_box_count()
+
+    def _on_roi_changed(self, _roi) -> None:
+        # region mode: auto preview after drawing blue box
+        if self.import_canvas.mode() == ImageCanvas.MODE_ROI:
+            self._auto_preview_boxes()
+        else:
+            self._refresh_import_preview()
+
+    def _on_boxes_changed(self, boxes: list) -> None:
+        self.crop_count_label.setText(f"字框 {len(boxes)}")
+        self._status.showMessage(f"已手动框 {len(boxes)} 个字 — 框完后点「确认切字 → 审核」")
+
+    def _update_box_count(self) -> None:
+        n = len(self.import_canvas.boxes())
+        self.crop_count_label.setText(f"字框 {n}")
+
+    def _undo_char_box(self) -> None:
+        self.import_canvas.undo_box()
+        self._update_box_count()
+
+    def _clear_char_boxes(self) -> None:
+        self.import_canvas.clear_boxes()
+        self._update_box_count()
         self._refresh_import_preview()
 
     def _clear_roi(self) -> None:
         self.import_canvas.clear_roi()
+        if self.import_canvas.mode() == ImageCanvas.MODE_ROI:
+            self.import_canvas.clear_boxes()
         self._refresh_import_preview()
 
-    def _refresh_import_preview(self, keep_roi: bool = False) -> None:
-        del keep_roi
+    def _auto_preview_boxes(self) -> None:
+        """在蓝框（或整图）内自动生成绿字框。"""
         if not self.project or not self._current_import:
             return
-        path = self._current_import
         try:
             self._apply_preprocess_ui()
-            bgr = load_bgr(path)
+            bgr = load_bgr(self._current_import)
             roi = self.import_canvas.roi()
             sliced = crop_bgr(bgr, roi)
             binary = apply_preprocess(sliced, self.project.config.preprocess)
@@ -713,22 +794,39 @@ class MainWindow(QMainWindow):
             ox = roi[0] if roi else 0
             oy = roi[1] if roi else 0
             boxes = [(c.x + ox, c.y + oy, c.w, c.h) for c in crops]
+            self.import_canvas.set_boxes(boxes)
+            self._refresh_import_preview(keep_manual_boxes=True)
+            self._status.showMessage(f"自动预览 {len(boxes)} 个字框 — 不对就改「手动逐字框」")
+        except Exception as exc:
+            QMessageBox.warning(self, "自动切字失败", str(exc))
+
+    def _refresh_import_preview(self, keep_manual_boxes: bool = False) -> None:
+        del keep_manual_boxes
+        if not self.project or not self._current_import:
+            return
+        path = self._current_import
+        try:
+            self._apply_preprocess_ui()
+            bgr = load_bgr(path)
+            roi = self.import_canvas.roi()
             if self.chk_show_binary.isChecked():
-                canvas = np.zeros(bgr.shape[:2], dtype=np.uint8)
                 if roi:
+                    sliced = crop_bgr(bgr, roi)
+                    binary = apply_preprocess(sliced, self.project.config.preprocess)
+                    canvas = np.zeros(bgr.shape[:2], dtype=np.uint8)
                     x, y, w, h = roi
                     bh, bw = binary.shape[:2]
                     canvas[y : y + bh, x : x + bw] = binary
+                    show = canvas
                 else:
-                    canvas = binary
-                show = canvas
+                    show = apply_preprocess(bgr, self.project.config.preprocess)
             else:
                 show = bgr
-            self.import_canvas.set_image_bgr_or_gray(show, boxes, draw_stored_roi=True)
-            self.crop_count_label.setText(f"切出 {len(crops)} 字")
-            self._status.showMessage(
-                f"绿框={len(crops)} · {'已框选数字区' if roi else '未框选则切整图'} · 调好后点「切字并去审核」"
+            # 只刷新底图，保留已有绿字框
+            self.import_canvas.set_image_bgr_or_gray(
+                show, boxes=None, draw_stored_roi=True, keep_boxes=True
             )
+            self._update_box_count()
         except Exception as exc:
             self.import_canvas.setText(str(exc))
 
@@ -744,30 +842,44 @@ class MainWindow(QMainWindow):
         dest_raw = proj.raw_dir / src.name
         if not dest_raw.exists():
             shutil.copy2(src, dest_raw)
-        roi = self.import_canvas.roi()
-        try:
-            _binary, crops, sliced = segment_image(
-                src,
-                proj.config.preprocess,
-                roi=roi,
-                max_gap=self.gap_spin.value(),
+
+        boxes = self.import_canvas.boxes()
+        # If no manual/auto boxes yet, try auto once
+        if not boxes:
+            self._auto_preview_boxes()
+            boxes = self.import_canvas.boxes()
+        if not boxes:
+            QMessageBox.warning(
+                self,
+                "还没有字框",
+                "请先切换到「手动逐字框」，把每个数字各框一下；\n"
+                "或先「① 框整行数字」再点「自动预览切字」。",
             )
+            return
+
+        try:
+            bgr = load_bgr(src)
+            crops = crops_from_full_boxes(bgr, boxes, proj.config.preprocess)
         except Exception as exc:
             QMessageBox.critical(self, "切字失败", str(exc))
             return
         if not crops:
-            QMessageBox.warning(self, "未切出字符", "试试框更紧、开反色，或调大「间距」")
+            QMessageBox.warning(self, "未切出字符", "字框无效，请重新框选")
             return
+
+        roi = self.import_canvas.roi()
         if roi:
+            sliced = crop_bgr(bgr, roi)
             ok, buf = cv2.imencode(".png", sliced)
             if ok:
                 (proj.roi_dir / f"{src.stem}_roi.png").write_bytes(buf.tobytes())
+
         paths = save_pending_chars(proj, src, crops)
         self._reload_pending()
         self._refresh_project_info()
         self._update_header()
         self.tabs.setCurrentIndex(self.TAB_REVIEW)
-        self._status.showMessage(f"已切出 {len(paths)} 个字，开始标注吧")
+        self._status.showMessage(f"已主动切出 {len(paths)} 个字，开始标注")
 
     # ---------- review ----------
     def _reload_pending(self) -> None:

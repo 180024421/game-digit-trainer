@@ -20,9 +20,13 @@ def numpy_to_pixmap(gray_or_bgr) -> QPixmap:
 
 
 class ImageCanvas(QLabel):
-    """可缩放显示图片，支持拖拽框选 ROI，并叠加切字框。"""
+    """画布：区域模式框数字条；手动切字模式逐个框字符。"""
+
+    MODE_ROI = "roi"
+    MODE_CHAR = "char"
 
     roi_changed = pyqtSignal(object)  # tuple[x,y,w,h] | None
+    boxes_changed = pyqtSignal(list)  # list[tuple[x,y,w,h]]
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -39,12 +43,20 @@ class ImageCanvas(QLabel):
         self._drag_current: QPoint | None = None
         self._scale = 1.0
         self._offset = QPoint(0, 0)
-        self._enable_roi = True
+        self._mode = self.MODE_ROI
         self._draw_stored_roi = True
-        self.setText("截图后显示在这里\n按住鼠标拖拽，框住数字区域")
+        self._hint_roi = "区域模式：拖拽蓝框框住整行数字"
+        self._hint_char = "手动切字：每个字拖一个绿框，从左到右框完再点切字"
+        self.setText(self._hint_roi)
 
-    def set_enable_roi(self, enabled: bool) -> None:
-        self._enable_roi = enabled
+    def mode(self) -> str:
+        return self._mode
+
+    def set_mode(self, mode: str) -> None:
+        self._mode = mode if mode in (self.MODE_ROI, self.MODE_CHAR) else self.MODE_ROI
+        if self._src is None or self._src.isNull():
+            self.setText(self._hint_char if self._mode == self.MODE_CHAR else self._hint_roi)
+        self._repaint_canvas()
 
     def clear_image(self) -> None:
         self._src = None
@@ -53,7 +65,7 @@ class ImageCanvas(QLabel):
         self._drag_origin = None
         self._drag_current = None
         self.setPixmap(QPixmap())
-        self.setText("截图后显示在这里\n按住鼠标拖拽，框住数字区域")
+        self.setText(self._hint_char if self._mode == self.MODE_CHAR else self._hint_roi)
 
     def set_image_bgr_or_gray(
         self,
@@ -61,11 +73,30 @@ class ImageCanvas(QLabel):
         boxes: list[tuple[int, int, int, int]] | None = None,
         *,
         draw_stored_roi: bool = True,
+        keep_boxes: bool = False,
     ) -> None:
         self._src = numpy_to_pixmap(arr)
-        self._boxes = list(boxes or [])
+        if boxes is not None and not keep_boxes:
+            self._boxes = list(boxes)
         self._draw_stored_roi = draw_stored_roi
         self._repaint_canvas()
+
+    def set_boxes(self, boxes: list[tuple[int, int, int, int]]) -> None:
+        self._boxes = list(boxes)
+        self._repaint_canvas()
+        self.boxes_changed.emit(list(self._boxes))
+
+    def boxes(self) -> list[tuple[int, int, int, int]]:
+        return list(self._boxes)
+
+    def clear_boxes(self) -> None:
+        self.set_boxes([])
+
+    def undo_box(self) -> None:
+        if self._boxes:
+            self._boxes.pop()
+            self._repaint_canvas()
+            self.boxes_changed.emit(list(self._boxes))
 
     def set_roi(self, roi: tuple[int, int, int, int] | None) -> None:
         self._roi = roi
@@ -94,12 +125,8 @@ class ImageCanvas(QLabel):
         return QRect(x, y, dw, dh)
 
     def _widget_to_image(self, pos: QPoint) -> QPoint | None:
-        rect = self._image_rect_on_widget()
-        if rect is None or self._scale <= 0:
+        if self._image_rect_on_widget() is None or self._scale <= 0:
             return None
-        if not rect.contains(pos):
-            # still map, clamp later
-            pass
         ix = int((pos.x() - self._offset.x()) / self._scale)
         iy = int((pos.y() - self._offset.y()) / self._scale)
         return QPoint(ix, iy)
@@ -133,21 +160,27 @@ class ImageCanvas(QLabel):
             painter.drawRect(x, y, w, h)
 
         if self._boxes:
-            pen = QPen(QColor(50, 255, 120), max(1, base.width() // 500))
+            pen = QPen(QColor(50, 255, 120), max(2, base.width() // 450))
             painter.setPen(pen)
-            for bx, by, bw, bh in self._boxes:
+            for i, (bx, by, bw, bh) in enumerate(self._boxes):
                 painter.drawRect(bx, by, bw, bh)
+                painter.drawText(bx + 2, by + 14, str(i + 1))
 
-        if self._drag_origin is not None and self._drag_current is not None and self._src is not None:
+        if self._drag_origin is not None and self._drag_current is not None:
             p0 = self._widget_to_image(self._drag_origin)
             p1 = self._widget_to_image(self._drag_current)
             if p0 and p1:
                 roi = self._clamp_roi(p0.x(), p0.y(), p1.x(), p1.y())
                 if roi:
                     x, y, w, h = roi
-                    pen = QPen(QColor(255, 200, 0), max(2, base.width() // 400), Qt.PenStyle.DashLine)
+                    color = (
+                        QColor(80, 255, 120)
+                        if self._mode == self.MODE_CHAR
+                        else QColor(255, 200, 0)
+                    )
+                    pen = QPen(color, max(2, base.width() // 400), Qt.PenStyle.DashLine)
                     painter.setPen(pen)
-                    painter.setBrush(QColor(255, 200, 0, 35))
+                    painter.setBrush(QColor(color.red(), color.green(), color.blue(), 40))
                     painter.drawRect(x, y, w, h)
 
         painter.end()
@@ -167,10 +200,8 @@ class ImageCanvas(QLabel):
         self._repaint_canvas()
 
     def mousePressEvent(self, event) -> None:  # noqa: N802
-        if not self._enable_roi or event.button() != Qt.MouseButton.LeftButton:
+        if event.button() != Qt.MouseButton.LeftButton or self._src is None:
             return super().mousePressEvent(event)
-        if self._src is None:
-            return
         self._drag_origin = event.position().toPoint()
         self._drag_current = self._drag_origin
         self._repaint_canvas()
@@ -188,11 +219,17 @@ class ImageCanvas(QLabel):
         p1 = self._widget_to_image(event.position().toPoint())
         self._drag_origin = None
         self._drag_current = None
-        if p0 and p1:
-            roi = self._clamp_roi(p0.x(), p0.y(), p1.x(), p1.y())
-            if roi:
-                self.set_roi(roi)
-            else:
-                self._repaint_canvas()
-        else:
+        if not (p0 and p1):
             self._repaint_canvas()
+            return
+        box = self._clamp_roi(p0.x(), p0.y(), p1.x(), p1.y())
+        if not box:
+            self._repaint_canvas()
+            return
+        if self._mode == self.MODE_CHAR:
+            self._boxes.append(box)
+            self._boxes.sort(key=lambda b: (b[0], b[1]))
+            self._repaint_canvas()
+            self.boxes_changed.emit(list(self._boxes))
+        else:
+            self.set_roi(box)
