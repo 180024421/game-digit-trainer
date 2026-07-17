@@ -144,9 +144,12 @@ def save_pending_chars(
     source: Path,
     crops: list[CharCrop],
 ) -> list[Path]:
+    from game_digit_trainer.sample_meta import record_pending_batch
+
     project.ensure_dirs()
     stem = source.stem
     out: list[Path] = []
+    boxes: list[tuple[int, int, int, int]] = []
     for i, crop in enumerate(crops):
         name = f"{stem}_{i:03d}.png"
         dest = project.pending_dir / name
@@ -156,11 +159,15 @@ def save_pending_chars(
             continue
         dest.write_bytes(buf.tobytes())
         out.append(dest)
+        boxes.append((crop.x, crop.y, crop.w, crop.h))
+    if out:
+        record_pending_batch(project, source, out, boxes)
     return out
 
 
 def move_to_label(project: GameProject, pending: Path, label: str) -> Path:
     from game_digit_trainer.labels import normalize_label
+    from game_digit_trainer.sample_meta import rename_meta_key
 
     name = normalize_label(label)
     if name not in project.config.classes:
@@ -174,6 +181,7 @@ def move_to_label(project: GameProject, pending: Path, label: str) -> Path:
         n += 1
     dest.write_bytes(pending.read_bytes())
     pending.unlink(missing_ok=True)
+    rename_meta_key(project, pending.name, dest.name)
     return dest
 
 
@@ -186,12 +194,46 @@ def list_dataset_files(project: GameProject, label: str) -> list[Path]:
     )
 
 
+def move_to_pending(project: GameProject, labeled_path: Path) -> Path:
+    """把已标注样本退回待审核。"""
+    from game_digit_trainer.sample_meta import rename_meta_key
+
+    project.ensure_dirs()
+    dest = project.pending_dir / labeled_path.name
+    n = 1
+    while dest.exists():
+        dest = project.pending_dir / f"{labeled_path.stem}_{n}{labeled_path.suffix}"
+        n += 1
+    dest.write_bytes(labeled_path.read_bytes())
+    labeled_path.unlink(missing_ok=True)
+    rename_meta_key(project, labeled_path.name, dest.name)
+    return dest
+
+
+def list_all_labeled(project: GameProject) -> list[tuple[Path, str]]:
+    """返回 [(path, class_name), ...]，按修改时间新到旧。"""
+    items: list[tuple[Path, str, float]] = []
+    for name in project.config.classes:
+        for p in list_dataset_files(project, name):
+            try:
+                mtime = p.stat().st_mtime
+            except OSError:
+                mtime = 0.0
+            items.append((p, name, mtime))
+    items.sort(key=lambda t: t[2], reverse=True)
+    return [(p, name) for p, name, _ in items]
+
+
 def relabel_dataset_file(project: GameProject, path: Path, new_label: str) -> Path:
     from game_digit_trainer.labels import normalize_label
+    from game_digit_trainer.sample_meta import rename_meta_key
 
     name = normalize_label(new_label)
     if name not in project.config.classes:
         raise ValueError(f"项目未启用类别: {name}")
+    # 同目录同标签：无需移动
+    if path.parent.name == name and path.is_file():
+        return path
     dest_dir = project.dataset_dir / name
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest = dest_dir / path.name
@@ -201,6 +243,7 @@ def relabel_dataset_file(project: GameProject, path: Path, new_label: str) -> Pa
         n += 1
     dest.write_bytes(path.read_bytes())
     path.unlink(missing_ok=True)
+    rename_meta_key(project, path.name, dest.name)
     return dest
 
 

@@ -83,10 +83,34 @@ QPushButton#digitBtn {
   min-height: 52px;
   padding: 0;
 }
+QPushButton#suggestedBtn {
+  font-size: 20px;
+  font-weight: 700;
+  min-width: 52px;
+  min-height: 52px;
+  padding: 0;
+  background: #fef3c7;
+  border: 2px solid #f59e0b;
+  color: #92400e;
+}
 QPushButton#unitBtn {
   font-size: 16px;
   font-weight: 600;
   min-height: 44px;
+}
+QPushButton#unitBtn[objectName="suggestedBtn"], QPushButton#suggestedBtn {
+  background: #fef3c7;
+  border: 2px solid #f59e0b;
+}
+QFrame#guideBanner {
+  background: #eff6ff;
+  border: 1px solid #93c5fd;
+  border-radius: 10px;
+}
+QLabel#guideLabel {
+  color: #1e40af;
+  font-size: 14px;
+  font-weight: 600;
 }
 QLineEdit, QSpinBox, QComboBox, QTextEdit, QListWidget {
   background: #ffffff;

@@ -78,3 +78,36 @@ def predict_pending_file(
     if img is None:
         raise ValueError(f"无法读取: {pending}")
     return predict_char(model, use_classes, img, w or width, h or height)
+
+
+def predict_boxes_string(
+    project: GameProject,
+    bgr: np.ndarray,
+    boxes: list[tuple[int, int, int, int]],
+    checkpoint: Path,
+    *,
+    conf_threshold: float = 0.5,
+) -> tuple[str, list[tuple[str, float]]]:
+    """按手动字框顺序推理整行字符串。"""
+    from game_digit_trainer.labels import display_label
+    from game_digit_trainer.segment import crops_from_full_boxes
+
+    model, classes, w, h = load_checkpoint(checkpoint)
+    crops = crops_from_full_boxes(bgr, boxes, project.config.preprocess)
+    parts: list[tuple[str, float]] = []
+    for crop in crops:
+        label, conf = predict_char(model, classes, crop.image, w, h)
+        parts.append((label, conf))
+    text = "".join(
+        "?" if c < conf_threshold else display_label(l) for l, c in parts
+    )
+    return text, parts
+
+
+def check_onnx_dependency() -> tuple[bool, str]:
+    try:
+        import onnx  # noqa: F401
+
+        return True, f"onnx {getattr(onnx, '__version__', '')}"
+    except ImportError:
+        return False, "未安装 onnx。请运行: pip install onnx onnxscript"

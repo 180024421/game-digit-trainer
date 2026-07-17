@@ -17,6 +17,12 @@ def export_onnx(
     *,
     out_dir: Path | None = None,
 ) -> Path:
+    from game_digit_trainer.predict import check_onnx_dependency
+
+    ok, msg = check_onnx_dependency()
+    if not ok:
+        raise RuntimeError(msg)
+
     ckpt = torch.load(checkpoint, map_location="cpu", weights_only=False)
     classes: list[str] = list(ckpt.get("classes") or project.config.classes)
     w = int(ckpt.get("input_width") or project.config.input_width)

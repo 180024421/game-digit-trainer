@@ -7,31 +7,42 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from PyQt6.QtCore import Qt, QThread, QTimer, QSize, pyqtSignal
+from PyQt6.QtCore import Qt, QByteArray, QThread, QTimer, QSize, pyqtSignal
 from PyQt6.QtGui import QIcon, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDoubleSpinBox,
     QFileDialog,
     QFrame,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QSpinBox,
     QSplitter,
     QTabWidget,
     QTextEdit,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
+
+from game_digit_trainer.balance import balance_warnings, format_balance_text
+from game_digit_trainer.gold import compare_preds, tokenize_expected
+from game_digit_trainer.hard_examples import add_hard_example, list_hard_files, load_hard_index, remove_hard_file
+from game_digit_trainer.quality import export_quality_report, verify_onnx_runtime
+from game_digit_trainer.templates import resolve_template, template_choices
+from game_digit_trainer.window_capture import capture_window_by_title
 
 from game_digit_trainer.capture import (
     capture_adb,
@@ -43,22 +54,27 @@ from game_digit_trainer.capture import (
 from game_digit_trainer.export_onnx import export_onnx, latest_checkpoint
 from game_digit_trainer.gui.region_capture import RegionCaptureOverlay
 from game_digit_trainer.gui.theme import APP_QSS
+from game_digit_trainer.gui.ui_prefs import load_prefs, update_prefs
 from game_digit_trainer.gui.widgets import ImageCanvas, numpy_to_pixmap
 from game_digit_trainer.labels import display_label, normalize_label
-from game_digit_trainer.predict import predict_pending_file
+from game_digit_trainer.predict import check_onnx_dependency, predict_boxes_string, predict_pending_file
 from game_digit_trainer.preprocess import apply_preprocess, load_bgr
 from game_digit_trainer.project import (
     GameProject,
+    RoiPreset,
     create_project,
     ensure_unit_classes,
     open_project,
     projects_root,
 )
+from game_digit_trainer.sample_meta import get_meta, resolve_source
 from game_digit_trainer.segment import (
     crop_bgr,
     crops_from_full_boxes,
+    list_all_labeled,
     list_dataset_files,
     move_to_label,
+    move_to_pending,
     relabel_dataset_file,
     save_pending_chars,
     segment_binary,
@@ -72,16 +88,18 @@ class TrainWorker(QThread):
     done = pyqtSignal(str)
     failed = pyqtSignal(str)
 
-    def __init__(self, project: GameProject, epochs: int) -> None:
+    def __init__(self, project: GameProject, epochs: int, *, augment: bool = True) -> None:
         super().__init__()
         self.project = project
         self.epochs = epochs
+        self.augment = augment
 
     def run(self) -> None:
         try:
             path = train_project(
                 self.project,
                 epochs=self.epochs,
+                augment=self.augment,
                 log=lambda m: self.log.emit(m),
             )
             self.done.emit(str(path))
@@ -108,6 +126,23 @@ class MainWindow(QMainWindow):
         self._pred_conf: float = 0.0
         self._current_import: Path | None = None
         self._region_overlay = None
+        self._review_mode = "pending"  # pending | labeled
+        self._labeled: list[tuple[Path, str]] = []
+        self._labeled_idx = 0
+        self._undo_stack: list[dict] = []
+        self._last_labeled_path: Path | None = None
+        self._batch_confirming = False
+        self._last_roi: tuple[int, int, int, int] | None = None
+        self._pending_apply_roi = False
+        self._hard: list[Path] = []
+        self._hard_idx = 0
+        self._preview_timer = QTimer(self)
+        self._preview_timer.setSingleShot(True)
+        self._preview_timer.timeout.connect(self._preview_recognize_silent)
+        self._digit_btns: dict[str, QPushButton] = {}
+        self._unit_btns: dict[str, QPushButton] = {}
+        self._ui_prefs = load_prefs()
+        self._guide_step = 0
 
         root = QWidget()
         self.setCentralWidget(root)
@@ -135,7 +170,7 @@ class MainWindow(QMainWindow):
         self._status = self.statusBar()
         self._status.showMessage("先打开或新建项目，再用「框选截屏」抓取游戏数字区域")
 
-        QTimer.singleShot(0, self._try_autoload_last_project)
+        QTimer.singleShot(0, self._bootstrap_ui_prefs)
 
     # ---------- top bar / project ----------
     def _build_top_bar(self) -> QWidget:
@@ -164,6 +199,14 @@ class MainWindow(QMainWindow):
         self.game_id_edit.setMaximumWidth(140)
         lay.addWidget(self.game_id_edit)
 
+        self.template_combo = QComboBox()
+        self.template_combo.setToolTip("新建项目时的类别模板")
+        for key, lab in template_choices():
+            self.template_combo.addItem(lab, key)
+        idx = self.template_combo.findData("coins")
+        if idx >= 0:
+            self.template_combo.setCurrentIndex(idx)
+        lay.addWidget(self.template_combo)
         self.chk_units = QCheckBox("万/亿")
         self.chk_units.setChecked(True)
         self.chk_symbols = QCheckBox(",/%:")
@@ -190,51 +233,87 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(8)
 
-        # Step 1 capture
+        self.guide_banner = QFrame()
+        self.guide_banner.setObjectName("guideBanner")
+        gl = QHBoxLayout(self.guide_banner)
+        gl.setContentsMargins(12, 8, 12, 8)
+        self.guide_label = QLabel()
+        self.guide_label.setWordWrap(True)
+        self.guide_label.setObjectName("guideLabel")
+        btn_guide_next = QPushButton("下一步")
+        btn_guide_skip = QPushButton("跳过引导")
+        btn_guide_next.clicked.connect(self._guide_next)
+        btn_guide_skip.clicked.connect(self._guide_skip)
+        gl.addWidget(self.guide_label, 1)
+        gl.addWidget(btn_guide_next)
+        gl.addWidget(btn_guide_skip)
+        layout.addWidget(self.guide_banner)
+        self.guide_banner.setVisible(False)
+
         cap = QHBoxLayout()
-        step1 = QLabel("第一步：截取画面")
+        step1 = QLabel("主操作")
         step1.setObjectName("stepLabel")
         cap.addWidget(step1)
         btn_region = QPushButton("框选截屏  F2")
         btn_region.setObjectName("primaryBtn")
-        btn_adb = QPushButton("ADB 截图")
+        btn_adb = QPushButton("ADB")
+        btn_win = QPushButton("雷电窗口")
+        btn_win.setToolTip("按窗口标题截取（默认含「雷电」）")
+        btn_win.clicked.connect(self._capture_ld_window)
+        btn_recap = QPushButton("再截同 ROI")
+        btn_recap.setToolTip("截一张新图并套用上次蓝框位置（适合反复刷同一 HUD）")
         btn_paste = QPushButton("粘贴")
-        btn_pick = QPushButton("打开文件…")
+        btn_pick = QPushButton("打开…")
         btn_region.clicked.connect(self._capture_region)
         btn_adb.clicked.connect(self._capture_adb)
+        btn_recap.clicked.connect(self._recapture_same_roi)
         btn_paste.clicked.connect(self._capture_clipboard)
         btn_pick.clicked.connect(self._pick_images)
         cap.addWidget(btn_region)
         cap.addWidget(btn_adb)
+        cap.addWidget(btn_win)
+        cap.addWidget(btn_recap)
         cap.addWidget(btn_paste)
         cap.addWidget(btn_pick)
         cap.addStretch()
         layout.addLayout(cap)
 
         splitter = QSplitter()
+        self.work_splitter = splitter
         layout.addWidget(splitter, 1)
 
-        # Main canvas
         mid = QWidget()
         mid_l = QVBoxLayout(mid)
         mid_l.setContentsMargins(0, 0, 0, 0)
 
         mode_row = QHBoxLayout()
-        step2 = QLabel("第二步：切字")
-        step2.setObjectName("stepLabel")
-        mode_row.addWidget(step2)
-        self.btn_mode_roi = QPushButton("① 框整行数字")
-        self.btn_mode_char = QPushButton("② 手动逐字框（推荐）")
+        mode_row.addWidget(QLabel("框字"))
+        self.btn_mode_roi = QPushButton("整行蓝框")
+        self.btn_mode_char = QPushButton("逐字绿框（推荐）")
         self.btn_mode_char.setObjectName("primaryBtn")
         self.btn_mode_roi.clicked.connect(lambda: self._set_cut_mode("roi"))
         self.btn_mode_char.clicked.connect(lambda: self._set_cut_mode("char"))
         mode_row.addWidget(self.btn_mode_roi)
         mode_row.addWidget(self.btn_mode_char)
+        self.crop_count_label = QLabel("字框 0")
+        self.crop_count_label.setObjectName("hintLabel")
+        mode_row.addWidget(self.crop_count_label)
         mode_row.addStretch()
+        btn_undo = QPushButton("撤销框 Ctrl+Z")
+        btn_undo.clicked.connect(self._undo_char_box)
+        btn_clear_boxes = QPushButton("清空框")
+        btn_clear_boxes.clicked.connect(self._clear_char_boxes)
+        btn_seg = QPushButton("确认切字 Enter")
+        btn_seg.setObjectName("successBtn")
+        btn_seg.setToolTip("快捷键 Enter")
+        btn_seg.clicked.connect(self._segment_current)
+        mode_row.addWidget(btn_undo)
+        mode_row.addWidget(btn_clear_boxes)
+        mode_row.addWidget(btn_seg)
         mid_l.addLayout(mode_row)
 
         self.work_hint = QLabel(
-            "推荐：点「手动逐字框」→ 每个数字拖一个绿框（如 2 : 0 3 共 4 个）→ 再点绿色切字"
+            "拖绿框逐字框选；点选后可拖移/拖角改大小。Enter 切字 · Ctrl+Z 撤销上一框"
         )
         self.work_hint.setObjectName("hintLabel")
         self.work_hint.setWordWrap(True)
@@ -247,14 +326,65 @@ class MainWindow(QMainWindow):
         self.import_canvas.view_changed.connect(self._on_view_changed)
         mid_l.addWidget(self.import_canvas, 1)
 
+        self.preview_big = QLabel("识别预览：框选数字后点「预览识别」")
+        self.preview_big.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.preview_big.setMinimumHeight(56)
+        self.preview_big.setStyleSheet(
+            "background:#111827; color:#fbbf24; border-radius:10px; font-size:28px; font-weight:800; padding:8px;"
+        )
+        mid_l.addWidget(self.preview_big)
+
+        main_tools = QHBoxLayout()
+        btn_auto = QPushButton("自动预览切字")
+        btn_auto.clicked.connect(self._auto_preview_boxes)
+        btn_preview = QPushButton("预览识别")
+        btn_preview.setObjectName("primaryBtn")
+        btn_preview.setToolTip("对当前绿框跑模型，图上叠字 + 下方大号结果")
+        btn_preview.clicked.connect(self._preview_recognize)
+        btn_split = QPushButton("拆粘连")
+        btn_split.setToolTip("把选中的绿框左右拆成两个")
+        btn_split.clicked.connect(self._split_selected_box)
+        btn_multi = QPushButton("多ROI刷样")
+        btn_multi.setToolTip("ADB截图后对所有ROI预设依次切字进待审")
+        btn_multi.clicked.connect(self._multi_roi_sample)
+        self.btn_more = QToolButton()
+        self.btn_more.setText("更多 ▾")
+        self.btn_more.setCheckable(True)
+        self.btn_more.setChecked(False)
+        self.btn_more.toggled.connect(self._toggle_work_more)
+        main_tools.addWidget(btn_auto)
+        main_tools.addWidget(btn_preview)
+        main_tools.addWidget(btn_split)
+        main_tools.addWidget(btn_multi)
+        main_tools.addStretch()
+        main_tools.addWidget(self.btn_more)
+        mid_l.addLayout(main_tools)
+
+        gold_row = QHBoxLayout()
+        gold_row.addWidget(QLabel("金标"))
+        self.gold_edit = QLineEdit()
+        self.gold_edit.setPlaceholderText("例如 1234万 或 2:03 — 与预览对比，错字进难例/待审")
+        btn_gold = QPushButton("对比回流")
+        btn_gold.clicked.connect(self._gold_compare_reflow)
+        gold_row.addWidget(self.gold_edit, 1)
+        gold_row.addWidget(btn_gold)
+        mid_l.addLayout(gold_row)
+
+        self.trial_result = QLabel("预览明细：训练后可用")
+        self.trial_result.setObjectName("hintLabel")
+        self.trial_result.setWordWrap(True)
+        mid_l.addWidget(self.trial_result)
+
+        self.work_more = QWidget()
+        more_l = QVBoxLayout(self.work_more)
+        more_l.setContentsMargins(0, 4, 0, 0)
         zoom_row = QHBoxLayout()
         self.zoom_label = QLabel("缩放 1.0x")
         self.zoom_label.setObjectName("hintLabel")
-        btn_zoom_roi = QPushButton("放大到蓝框")
-        btn_zoom_roi.setToolTip("把蓝框区域放大到视野中央，方便框小字")
+        btn_zoom_roi = QPushButton("放大蓝框")
         btn_zoom_fit = QPushButton("适应窗口")
-        btn_zoom_in = QPushButton("放大 +")
-        btn_zoom_out = QPushButton("缩小 -")
+        btn_zoom_in = QPushButton("+")
+        btn_zoom_out = QPushButton("-")
         btn_zoom_roi.clicked.connect(self._zoom_to_roi)
         btn_zoom_fit.clicked.connect(self.import_canvas.reset_view)
         btn_zoom_in.clicked.connect(lambda: self._nudge_zoom(1.25))
@@ -265,10 +395,26 @@ class MainWindow(QMainWindow):
         zoom_row.addWidget(btn_zoom_out)
         zoom_row.addWidget(btn_zoom_fit)
         zoom_row.addStretch()
-        mid_l.addLayout(zoom_row)
+        more_l.addLayout(zoom_row)
+
+        preset_row = QHBoxLayout()
+        preset_row.addWidget(QLabel("ROI 预设"))
+        self.roi_preset_combo = QComboBox()
+        self.roi_preset_combo.setMinimumWidth(140)
+        btn_preset_apply = QPushButton("套用")
+        btn_preset_save = QPushButton("保存蓝框")
+        btn_preset_del = QPushButton("删")
+        btn_preset_apply.clicked.connect(self._apply_roi_preset)
+        btn_preset_save.clicked.connect(self._save_roi_preset)
+        btn_preset_del.clicked.connect(self._delete_roi_preset)
+        preset_row.addWidget(self.roi_preset_combo, 1)
+        preset_row.addWidget(btn_preset_apply)
+        preset_row.addWidget(btn_preset_save)
+        preset_row.addWidget(btn_preset_del)
+        more_l.addLayout(preset_row)
+
         tools = QHBoxLayout()
-        self.chk_show_binary = QCheckBox("看二值图")
-        self.chk_show_binary.setChecked(False)
+        self.chk_show_binary = QCheckBox("二值图")
         self.chk_show_binary.stateChanged.connect(lambda _: self._refresh_import_preview())
         self.chk_invert = QCheckBox("反色")
         self.chk_invert.stateChanged.connect(lambda _: self._refresh_import_preview())
@@ -278,44 +424,25 @@ class MainWindow(QMainWindow):
         self.gap_spin = QSpinBox()
         self.gap_spin.setRange(1, 20)
         self.gap_spin.setValue(3)
-        self.gap_spin.setToolTip("仅「框整行+自动切」时用：粘连调大，切碎调小")
         self.gap_spin.valueChanged.connect(lambda _: self._refresh_import_preview())
+        btn_clear_roi = QPushButton("取消蓝框")
+        btn_clear_roi.clicked.connect(self._clear_roi)
         tools.addWidget(self.chk_show_binary)
         tools.addWidget(self.chk_invert)
         tools.addWidget(QLabel("二值化"))
         tools.addWidget(self.binarize_combo)
-        tools.addWidget(QLabel("自动间距"))
+        tools.addWidget(QLabel("间距"))
         tools.addWidget(self.gap_spin)
-
-        btn_auto = QPushButton("自动预览切字")
-        btn_auto.setToolTip("在蓝框区域内自动生成绿框（可再改成手动微调）")
-        btn_auto.clicked.connect(self._auto_preview_boxes)
-        btn_undo = QPushButton("撤销一字")
-        btn_undo.clicked.connect(self._undo_char_box)
-        btn_clear_boxes = QPushButton("清空字框")
-        btn_clear_boxes.clicked.connect(self._clear_char_boxes)
-        btn_clear_roi = QPushButton("取消蓝框")
-        btn_clear_roi.clicked.connect(self._clear_roi)
-        self.crop_count_label = QLabel("字框 0")
-        self.crop_count_label.setObjectName("hintLabel")
-        btn_seg = QPushButton("确认切字 → 审核")
-        btn_seg.setObjectName("successBtn")
-        btn_seg.setToolTip("把当前绿框切成单字样本，进入审核标注")
-        btn_seg.clicked.connect(self._segment_current)
-        tools.addWidget(btn_auto)
-        tools.addWidget(btn_undo)
-        tools.addWidget(btn_clear_boxes)
         tools.addWidget(btn_clear_roi)
         tools.addStretch()
-        tools.addWidget(self.crop_count_label)
-        tools.addWidget(btn_seg)
-        mid_l.addLayout(tools)
+        more_l.addLayout(tools)
+        mid_l.addWidget(self.work_more)
+        self.work_more.setVisible(False)
+
         splitter.addWidget(mid)
 
-        # default to manual char cutting — more reliable for game fonts
         self._set_cut_mode("char")
 
-        # History
         right = QWidget()
         right.setMaximumWidth(220)
         rl = QVBoxLayout(right)
@@ -337,10 +464,24 @@ class MainWindow(QMainWindow):
         layout.setSpacing(12)
 
         gallery = QVBoxLayout()
+        mode_row = QHBoxLayout()
+        self.btn_rev_pending = QPushButton('待审')
+        self.btn_rev_labeled = QPushButton('已标注（可改）')
+        self.btn_rev_hard = QPushButton('难例')
+        self.btn_rev_pending.setObjectName('primaryBtn')
+        self.btn_rev_pending.clicked.connect(lambda: self._set_review_mode('pending'))
+        self.btn_rev_labeled.clicked.connect(lambda: self._set_review_mode('labeled'))
+        self.btn_rev_hard.clicked.connect(lambda: self._set_review_mode('hard'))
+        mode_row.addWidget(self.btn_rev_pending)
+        mode_row.addWidget(self.btn_rev_labeled)
+        mode_row.addWidget(self.btn_rev_hard)
+        gallery.addLayout(mode_row)
+
         gal_head = QHBoxLayout()
-        gal_head.addWidget(QLabel('待审预览（点击选择）'))
+        self.gallery_title = QLabel('待审预览（点击选择）')
         btn_reload = QPushButton('刷新')
-        btn_reload.clicked.connect(self._reload_pending)
+        btn_reload.clicked.connect(self._reload_review_lists)
+        gal_head.addWidget(self.gallery_title)
         gal_head.addWidget(btn_reload)
         gallery.addLayout(gal_head)
 
@@ -350,10 +491,10 @@ class MainWindow(QMainWindow):
         self.pending_list.setResizeMode(QListWidget.ResizeMode.Adjust)
         self.pending_list.setMovement(QListWidget.Movement.Static)
         self.pending_list.setSpacing(6)
-        self.pending_list.setMinimumWidth(200)
-        self.pending_list.setMaximumWidth(260)
+        self.pending_list.setMinimumWidth(220)
+        self.pending_list.setMaximumWidth(280)
         self.pending_list.setWordWrap(True)
-        self.pending_list.currentRowChanged.connect(self._on_pending_selected)
+        self.pending_list.currentRowChanged.connect(self._on_gallery_selected)
         gallery.addWidget(self.pending_list, 1)
         layout.addLayout(gallery)
 
@@ -362,6 +503,20 @@ class MainWindow(QMainWindow):
         self.review_meta.setObjectName('titleLabel')
         center.addWidget(self.review_meta)
 
+        self.review_progress = QProgressBar()
+        self.review_progress.setTextVisible(True)
+        self.review_progress.setFormat('已标 %v / 共 %m')
+        self.review_progress.setMinimum(0)
+        self.review_progress.setMaximum(1)
+        self.review_progress.setValue(0)
+        center.addWidget(self.review_progress)
+
+        self.batch_stop_label = QLabel('')
+        self.batch_stop_label.setObjectName('hintLabel')
+        self.batch_stop_label.setWordWrap(True)
+        self.batch_stop_label.setVisible(False)
+        center.addWidget(self.batch_stop_label)
+
         self.char_view = QLabel('左侧点选待审缩略图\n或去「截图切字」')
         self.char_view.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.char_view.setMinimumSize(360, 360)
@@ -369,6 +524,15 @@ class MainWindow(QMainWindow):
             'background:#111827; color:#9ca3af; border-radius:12px; font-size:16px;'
         )
         center.addWidget(self.char_view, 1)
+
+        self.context_view = QLabel("原图对照：切字后显示整行 + 当前字高亮")
+        self.context_view.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.context_view.setMinimumHeight(120)
+        self.context_view.setMaximumHeight(160)
+        self.context_view.setStyleSheet(
+            "background:#0f172a; color:#94a3b8; border-radius:10px; font-size:13px;"
+        )
+        center.addWidget(self.context_view)
 
         nav = QHBoxLayout()
         btn_prev = QPushButton('← 上一张')
@@ -392,28 +556,59 @@ class MainWindow(QMainWindow):
         self.btn_confirm.clicked.connect(self._confirm_prediction)
         right.addWidget(self.btn_confirm)
 
-        right.addWidget(QLabel('点下面按钮标注当前大图（一次一个字）'))
+        conf_row = QHBoxLayout()
+        self.chk_batch_confirm = QCheckBox('批量确认（≥阈值连过）')
+        self.chk_batch_confirm.setChecked(True)
+        self.chk_batch_confirm.setToolTip('空格确认后，自动继续确认高置信预测，直到低于阈值')
+        conf_row.addWidget(self.chk_batch_confirm)
+        conf_row.addWidget(QLabel('阈值'))
+        self.conf_spin = QDoubleSpinBox()
+        self.conf_spin.setRange(0.5, 0.99)
+        self.conf_spin.setSingleStep(0.05)
+        self.conf_spin.setValue(0.85)
+        self.conf_spin.setDecimals(2)
+        self.conf_spin.valueChanged.connect(self._persist_confirm_threshold)
+        conf_row.addWidget(self.conf_spin)
+        right.addLayout(conf_row)
+
+        btn_jump_last = QPushButton('查看刚标的那张')
+        btn_jump_last.setToolTip('跳到最近一次标注的样本，方便立刻改错')
+        btn_jump_last.clicked.connect(self._jump_to_last_labeled)
+        right.addWidget(btn_jump_last)
+
+        right.addWidget(QLabel('点下面按钮标注 / 改标当前大图'))
         grid = QGridLayout()
         grid.setSpacing(8)
+        self._digit_btns = {}
         for i in range(10):
             b = QPushButton(str(i))
             b.setObjectName('digitBtn')
             b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
             b.clicked.connect(lambda _=False, d=str(i): self._assign(d))
             grid.addWidget(b, i // 5, i % 5)
+            self._digit_btns[str(i)] = b
         right.addLayout(grid)
 
         right.addWidget(QLabel('单位 / 符号'))
         unit_row = QHBoxLayout()
+        self._unit_btns = {}
         for text, lab in [('万 W', '万'), ('亿 Y', '亿'), (',', ','), ('/', '/'), ('%', '%'), (':', ':')]:
             b = QPushButton(text)
             b.setObjectName('unitBtn')
             b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
             b.clicked.connect(lambda _=False, d=lab: self._assign(d))
             unit_row.addWidget(b)
+            self._unit_btns[lab] = b
         right.addLayout(unit_row)
 
         act = QHBoxLayout()
+        self.btn_undo_label = QPushButton('撤销上一标 Ctrl+Z')
+        self.btn_undo_label.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.btn_undo_label.clicked.connect(self._undo_last_label)
+        btn_back = QPushButton('退回待审')
+        btn_back.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        btn_back.setToolTip('把当前已标注样本退回待审列表')
+        btn_back.clicked.connect(self._return_current_to_pending)
         btn_del = QPushButton('删除 Del')
         btn_del.setObjectName('dangerBtn')
         btn_del.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -421,11 +616,15 @@ class MainWindow(QMainWindow):
         btn_skip.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         btn_del.clicked.connect(self._delete_current)
         btn_skip.clicked.connect(self._next_pending)
+        act.addWidget(self.btn_undo_label)
+        act.addWidget(btn_back)
         act.addWidget(btn_del)
         act.addWidget(btn_skip)
         right.addLayout(act)
 
-        tip = QLabel('操作：左侧预览点选 → 中间看大图 → 右侧标一个字。快捷键 0-9 / W / Y / ←→ / Del')
+        tip = QLabel(
+            '标错了：点「已标注（可改）」选中后重新点数字改标，或「退回待审」/「撤销上一标」。'
+        )
         tip.setObjectName('hintLabel')
         tip.setWordWrap(True)
         right.addWidget(tip)
@@ -449,6 +648,15 @@ class MainWindow(QMainWindow):
             sc = QShortcut(QKeySequence(key), self)
             sc.setContext(Qt.ShortcutContext.WindowShortcut)
             sc.activated.connect(lambda lab=lab: self._review_only(lambda: self._assign(lab)))
+        sc = QShortcut(QKeySequence('Ctrl+Z'), self)
+        sc.setContext(Qt.ShortcutContext.WindowShortcut)
+        sc.activated.connect(self._undo_contextual)
+        sc_enter = QShortcut(QKeySequence(Qt.Key.Key_Return), self)
+        sc_enter.setContext(Qt.ShortcutContext.WindowShortcut)
+        sc_enter.activated.connect(self._enter_contextual)
+        sc_enter2 = QShortcut(QKeySequence(Qt.Key.Key_Enter), self)
+        sc_enter2.setContext(Qt.ShortcutContext.WindowShortcut)
+        sc_enter2.activated.connect(self._enter_contextual)
 
     def _build_train(self) -> None:
         layout = QHBoxLayout(self.tab_train)
@@ -468,6 +676,14 @@ class MainWindow(QMainWindow):
         self.epochs_spin.setRange(1, 200)
         self.epochs_spin.setValue(15)
         form.addWidget(self.epochs_spin)
+        self.chk_augment = QCheckBox("数据增强")
+        self.chk_augment.setChecked(True)
+        self.chk_augment.setToolTip("训练时轻微位移/对比度/缩放/噪声，截图少也能更稳")
+        self.chk_augment.stateChanged.connect(self._persist_augment)
+        form.addWidget(self.chk_augment)
+        self.chk_force_export = QCheckBox("强制导出")
+        self.chk_force_export.setToolTip("忽略质量门禁（样本不足/准确率偏低）")
+        form.addWidget(self.chk_force_export)
         btn_train = QPushButton("开始训练")
         btn_train.setObjectName("primaryBtn")
         btn_train.clicked.connect(self._start_train)
@@ -479,14 +695,25 @@ class MainWindow(QMainWindow):
         self.train_log.setReadOnly(True)
         left.addWidget(self.train_log, 1)
 
+        self.curve_label = QLabel("训练曲线：训练后显示")
+        self.curve_label.setObjectName("hintLabel")
+        self.curve_label.setWordWrap(True)
+        left.addWidget(self.curve_label)
+
         exp = QHBoxLayout()
         btn_export = QPushButton("导出 ONNX")
         btn_export.setObjectName("successBtn")
         btn_export.clicked.connect(self._export)
         btn_open_export = QPushButton("打开导出目录")
         btn_open_export.clicked.connect(self._open_export_dir)
+        btn_copy_export = QPushButton("复制导出路径")
+        btn_copy_export.clicked.connect(self._copy_export_path)
+        self.export_dep_label = QLabel("")
+        self.export_dep_label.setObjectName("hintLabel")
         exp.addWidget(btn_export)
         exp.addWidget(btn_open_export)
+        exp.addWidget(btn_copy_export)
+        exp.addWidget(self.export_dep_label)
         exp.addStretch()
         left.addLayout(exp)
         layout.addLayout(left, 2)
@@ -532,7 +759,7 @@ class MainWindow(QMainWindow):
     # ---------- helpers ----------
     def _on_tab_changed(self, index: int) -> None:
         if index == self.TAB_REVIEW:
-            self._reload_pending()
+            self._reload_review_lists()
         elif index == self.TAB_TRAIN:
             self._refresh_project_info()
             self._reload_dataset_browser()
@@ -558,7 +785,14 @@ class MainWindow(QMainWindow):
 
     def _goto_review(self) -> None:
         self.tabs.setCurrentIndex(self.TAB_REVIEW)
-        self._reload_pending()
+        if (
+            self.project
+            and not self.project.pending_files()
+            and sum(self.project.class_counts().values()) > 0
+        ):
+            self._set_review_mode("labeled")
+        else:
+            self._set_review_mode("pending")
 
     def _review_only(self, fn) -> None:
         if self.tabs.currentIndex() == self.TAB_REVIEW:
@@ -570,10 +804,22 @@ class MainWindow(QMainWindow):
             self.badge_pending.setVisible(False)
             return
         n = len(self.project.pending_files())
+        labeled_n = sum(self.project.class_counts().values())
         self.project_title.setText(f"项目：{self.project.config.game_id}")
-        self.badge_pending.setText(f"待审 {n}（点此标注）")
-        self.badge_pending.setVisible(n > 0)
-        self.tabs.setTabText(self.TAB_REVIEW, f"② 审核标注（{n}）" if n else "② 审核标注")
+        if n > 0:
+            self.badge_pending.setText(f"待审 {n}（点此标注）")
+            self.badge_pending.setVisible(True)
+        elif labeled_n > 0:
+            self.badge_pending.setText(f"已标 {labeled_n}（可点此改标）")
+            self.badge_pending.setVisible(True)
+        else:
+            self.badge_pending.setVisible(False)
+        tab = "② 审核标注"
+        if n:
+            tab = f"② 审核标注（待审{n}）"
+        elif labeled_n:
+            tab = f"② 审核标注（已标{labeled_n}）"
+        self.tabs.setTabText(self.TAB_REVIEW, tab)
 
     def _try_autoload_last_project(self) -> None:
         root = projects_root()
@@ -600,11 +846,18 @@ class MainWindow(QMainWindow):
         if not gid:
             QMessageBox.warning(self, "提示", "请填写项目名")
             return
+        key = self.template_combo.currentData() or "coins"
+        with_sym, with_units, force = resolve_template(str(key))
+        # 勾选可覆盖模板的 symbols/units（force 模板除外）
+        if force is None:
+            with_sym = self.chk_symbols.isChecked() or with_sym
+            with_units = self.chk_units.isChecked() or with_units
         try:
             self.project = create_project(
                 gid,
-                with_symbols=self.chk_symbols.isChecked(),
-                with_units=self.chk_units.isChecked(),
+                with_symbols=with_sym,
+                with_units=with_units,
+                classes=force,
             )
         except Exception as exc:
             QMessageBox.critical(self, "新建失败", str(exc))
@@ -613,7 +866,7 @@ class MainWindow(QMainWindow):
         self._refresh_project_info()
         self._update_header()
         self.tabs.setCurrentIndex(self.TAB_WORK)
-        self._status.showMessage(f"已创建，直接点「框选截屏」开始")
+        self._status.showMessage(f"已创建（模板：{self.template_combo.currentText()}）")
 
     def _open_project_dialog(self) -> None:
         path = QFileDialog.getExistingDirectory(self, "选择项目目录", str(projects_root()))
@@ -641,6 +894,13 @@ class MainWindow(QMainWindow):
         idx = self.binarize_combo.findText(cfg.binarize)
         if idx >= 0:
             self.binarize_combo.setCurrentIndex(idx)
+        self.conf_spin.blockSignals(True)
+        self.conf_spin.setValue(float(self.project.config.confirm_threshold))
+        self.conf_spin.blockSignals(False)
+        self.chk_augment.blockSignals(True)
+        self.chk_augment.setChecked(bool(self.project.config.augment))
+        self.chk_augment.blockSignals(False)
+        self._reload_roi_preset_combo()
 
     def _open_project_folder(self) -> None:
         proj = self._require_project()
@@ -665,8 +925,12 @@ class MainWindow(QMainWindow):
                 lines.append(f"  {display_label(k)}: {v}")
         ckpt = latest_checkpoint(self.project)
         lines.append(f"模型: {ckpt.parent.name if ckpt else '尚未训练'}")
+        lines.append("")
+        lines.append(format_balance_text(counts))
         self.project_info.setPlainText("\n".join(lines))
         self._update_header()
+        self._reload_roi_preset_combo()
+        self._update_export_dep_hint()
 
     def _add_units_to_project(self) -> None:
         proj = self._require_project()
@@ -688,16 +952,33 @@ class MainWindow(QMainWindow):
         proj.raw_dir.mkdir(parents=True, exist_ok=True)
         return proj.raw_dir
 
-    def _add_captured_path(self, path: Path) -> None:
+    def _add_captured_path(self, path: Path, *, apply_last_roi: bool = False) -> None:
         self.import_list.addItem(str(path))
         self.import_list.setCurrentRow(self.import_list.count() - 1)
         self.tabs.setCurrentIndex(self.TAB_WORK)
-        self._status.showMessage(f"已截取 {path.name} — 请在图上框选数字")
+        # 截完自动进逐字框，并略放大
+        QTimer.singleShot(50, lambda: self._after_capture_ready(apply_last_roi=apply_last_roi))
+        self._status.showMessage(f"已截取 {path.name} — 可直接拖绿框；Enter 切字")
+
+    def _after_capture_ready(self, *, apply_last_roi: bool = False) -> None:
+        self._set_cut_mode("char")
+        if apply_last_roi and self._last_roi:
+            self.import_canvas.set_roi(self._last_roi, auto_zoom=True)
+            self._status.showMessage("已套用上次 ROI，可继续框字或自动预览")
+        elif self.import_canvas.roi():
+            self.import_canvas.zoom_to_image()
+        else:
+            self.import_canvas.zoom_to_image()
+        if hasattr(self, "guide_banner") and self.guide_banner.isVisible() and self._guide_step == 0:
+            self._guide_step = 1
+            self._update_guide_banner()
 
     def _capture_region(self) -> None:
         dest = self._capture_dest_dir()
         if not dest:
             return
+        apply_roi = bool(getattr(self, "_pending_apply_roi", False))
+        self._pending_apply_roi = False
         self.showMinimized()
         QApplication.processEvents()
 
@@ -714,7 +995,7 @@ class MainWindow(QMainWindow):
 
                     bgr = qimage_to_bgr(qimg)
                     path = save_bgr(dest / _timestamp_name("region"), bgr)
-                    self._add_captured_path(path)
+                    self._add_captured_path(path, apply_last_roi=apply_roi)
                 except Exception as exc:
                     QMessageBox.critical(self, "截屏失败", str(exc))
 
@@ -727,7 +1008,6 @@ class MainWindow(QMainWindow):
             overlay.cancelled.connect(on_cancelled)
             overlay.show()
 
-        # brief delay so minimize finishes before grab
         QTimer.singleShot(180, start_overlay)
 
     def _capture_adb(self) -> None:
@@ -777,7 +1057,8 @@ class MainWindow(QMainWindow):
         for f in files:
             self.import_list.addItem(f)
         if files:
-            self.import_list.setCurrentRow(self.import_list.count() - len(files))
+            self.import_list.setCurrentRow(self.import_list.count() - 1)
+            QTimer.singleShot(50, lambda: self._after_capture_ready(apply_last_roi=False))
 
     def _on_import_row(self, row: int) -> None:
         if row < 0:
@@ -791,16 +1072,15 @@ class MainWindow(QMainWindow):
         self.import_canvas.set_mode(mode)
         if mode == "char":
             self.work_hint.setText(
-                "手动切字：滚轮放大 → 每个字拖一个绿框 →「确认切字」。右键拖动画布。"
+                "拖绿框逐字框选；点选后可拖移/拖角改大小。Enter 切字 · Ctrl+Z 撤销上一框"
             )
             self.btn_mode_char.setObjectName("primaryBtn")
             self.btn_mode_roi.setObjectName("")
-            # 若已有蓝框，自动放大方便框字
             if self.import_canvas.roi():
                 self.import_canvas.zoom_to_rect(self.import_canvas.roi(), margin=0.35)
         else:
             self.work_hint.setText(
-                "区域模式：拖蓝框框住数字行会自动放大 →「自动预览切字」或改手动逐字框"
+                "拖蓝框框住数字行（自动放大）→ 可自动预览或改逐字框。ROI 可在「更多」里保存预设"
             )
             self.btn_mode_roi.setObjectName("primaryBtn")
             self.btn_mode_char.setObjectName("")
@@ -809,6 +1089,7 @@ class MainWindow(QMainWindow):
         self.btn_mode_roi.style().unpolish(self.btn_mode_roi)
         self.btn_mode_roi.style().polish(self.btn_mode_roi)
         self._update_box_count()
+        update_prefs(cut_mode=mode)
 
     def _on_view_changed(self, zoom: float) -> None:
         self.zoom_label.setText(f"缩放 {zoom:.1f}x")
@@ -830,10 +1111,13 @@ class MainWindow(QMainWindow):
         c.view_changed.emit(c._user_zoom)
 
     def _on_roi_changed(self, _roi) -> None:
+        if _roi:
+            self._last_roi = tuple(int(v) for v in _roi)  # type: ignore[misc]
+            update_prefs(last_roi=list(self._last_roi))
         if self.import_canvas.mode() == ImageCanvas.MODE_ROI:
             self._auto_preview_boxes()
             if _roi:
-                self._status.showMessage("已自动放大蓝框区域 — 可改「手动逐字框」继续框小字")
+                self._status.showMessage("已自动放大蓝框区域 — 可改「逐字绿框」继续框小字")
         else:
             self._refresh_import_preview()
             if _roi:
@@ -841,7 +1125,12 @@ class MainWindow(QMainWindow):
 
     def _on_boxes_changed(self, boxes: list) -> None:
         self.crop_count_label.setText(f"字框 {len(boxes)}")
-        self._status.showMessage(f"已手动框 {len(boxes)} 个字 — 框完后点「确认切字 → 审核」")
+        self.import_canvas.set_predictions([])
+        if hasattr(self, "preview_big"):
+            self.preview_big.setText("识别预览：框好后点「预览识别」或稍等自动预览")
+        self._status.showMessage(f"已手动框 {len(boxes)} 个字 — Enter 切字 · 可点预览识别")
+        if boxes and self.project and latest_checkpoint(self.project):
+            self._preview_timer.start(450)
 
     def _update_box_count(self) -> None:
         n = len(self.import_canvas.boxes())
@@ -965,64 +1254,166 @@ class MainWindow(QMainWindow):
         self._status.showMessage(f"已主动切出 {len(paths)} 个字，开始标注")
 
     # ---------- review ----------
-    def _reload_pending(self) -> None:
+    def _set_review_mode(self, mode: str) -> None:
+        self._review_mode = mode if mode in ("pending", "labeled", "hard") else "pending"
+        self.btn_rev_pending.setObjectName("primaryBtn" if self._review_mode == "pending" else "")
+        self.btn_rev_labeled.setObjectName("primaryBtn" if self._review_mode == "labeled" else "")
+        if hasattr(self, "btn_rev_hard"):
+            self.btn_rev_hard.setObjectName("primaryBtn" if self._review_mode == "hard" else "")
+        if self._review_mode == "pending":
+            self.gallery_title.setText("待审预览（点击选择）")
+        elif self._review_mode == "labeled":
+            self.gallery_title.setText("已标注（点选后可改标/退回）")
+        else:
+            self.gallery_title.setText("难例（低置信/改标/金标失败）")
+        for b in (self.btn_rev_pending, self.btn_rev_labeled, getattr(self, "btn_rev_hard", None)):
+            if b is None:
+                continue
+            b.style().unpolish(b)
+            b.style().polish(b)
+        self._reload_review_lists()
+
+    def _reload_review_lists(self) -> None:
         if not self.project:
             return
         self._pending = self.project.pending_files()
-        self._rebuild_pending_gallery()
-        if self._pending:
-            self._idx = min(self._idx, len(self._pending) - 1)
-            self.pending_list.blockSignals(True)
-            self.pending_list.setCurrentRow(self._idx)
-            self.pending_list.blockSignals(False)
-        else:
-            self._idx = 0
+        self._labeled = list_all_labeled(self.project)
+        self._hard = list_hard_files(self.project)
+        self._rebuild_gallery()
         self._show_current()
         self._update_header()
+        self._update_review_progress()
 
-    def _rebuild_pending_gallery(self) -> None:
+    def _reload_pending(self) -> None:
+        self._reload_review_lists()
+
+    def _rebuild_gallery(self) -> None:
         self.pending_list.blockSignals(True)
         self.pending_list.clear()
-        for i, path in enumerate(self._pending):
-            item = QListWidgetItem(f"{i + 1}")
+        if self._review_mode == "pending":
+            items = [(p, None) for p in self._pending]
+        elif self._review_mode == "hard":
+            meta = {x.get("file"): x for x in load_hard_index(self.project)} if self.project else {}
+            items = []
+            for p in self._hard:
+                reason = (meta.get(p.name) or {}).get("reason") or "难例"
+                items.append((p, f"难:{reason}"))
+        else:
+            items = [(p, lab) for p, lab in self._labeled]
+        for i, (path, lab) in enumerate(items):
+            if lab is None:
+                title = f"{i + 1}"
+            elif str(lab).startswith("难:"):
+                title = str(lab)[2:6]
+            else:
+                title = f"{display_label(lab)}"
+            item = QListWidgetItem(title)
             item.setData(Qt.ItemDataRole.UserRole, str(path))
-            item.setToolTip(path.name)
+            tip = path.name if lab is None else f"{lab} · {path.name}"
+            item.setToolTip(tip)
             raw = np.fromfile(str(path), dtype=np.uint8)
             img = cv2.imdecode(raw, cv2.IMREAD_GRAYSCALE)
             if img is not None:
                 pix = numpy_to_pixmap(img).scaled(
-                    72,
-                    72,
-                    Qt.AspectRatioMode.KeepAspectRatio,
-                    Qt.TransformationMode.SmoothTransformation,
+                    72, 72, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation
                 )
                 item.setIcon(QIcon(pix))
             self.pending_list.addItem(item)
         self.pending_list.blockSignals(False)
+        if self._review_mode == "pending" and self._pending:
+            self._idx = min(self._idx, len(self._pending) - 1)
+            self.pending_list.blockSignals(True)
+            self.pending_list.setCurrentRow(self._idx)
+            self.pending_list.blockSignals(False)
+        elif self._review_mode == "labeled" and self._labeled:
+            self._labeled_idx = min(self._labeled_idx, len(self._labeled) - 1)
+            self.pending_list.blockSignals(True)
+            self.pending_list.setCurrentRow(self._labeled_idx)
+            self.pending_list.blockSignals(False)
+        elif self._review_mode == "hard" and self._hard:
+            self._hard_idx = min(self._hard_idx, len(self._hard) - 1)
+            self.pending_list.blockSignals(True)
+            self.pending_list.setCurrentRow(self._hard_idx)
+            self.pending_list.blockSignals(False)
+
+    def _on_gallery_selected(self, row: int) -> None:
+        if row < 0:
+            return
+        if self._review_mode == "pending":
+            if row >= len(self._pending):
+                return
+            self._idx = row
+        elif self._review_mode == "hard":
+            if row >= len(self._hard):
+                return
+            self._hard_idx = row
+        else:
+            if row >= len(self._labeled):
+                return
+            self._labeled_idx = row
+        self._show_current(sync_list=False)
 
     def _on_pending_selected(self, row: int) -> None:
-        if row < 0 or row >= len(self._pending):
-            return
-        self._idx = row
-        self._show_current(sync_list=False)
+        self._on_gallery_selected(row)
+
+    def _rebuild_pending_gallery(self) -> None:
+        self._rebuild_gallery()
+
+    def _current_review_path(self) -> Path | None:
+        if self._review_mode == "pending":
+            if not self._pending:
+                return None
+            self._idx = max(0, min(self._idx, len(self._pending) - 1))
+            return self._pending[self._idx]
+        if self._review_mode == "hard":
+            if not self._hard:
+                return None
+            self._hard_idx = max(0, min(self._hard_idx, len(self._hard) - 1))
+            return self._hard[self._hard_idx]
+        if not self._labeled:
+            return None
+        self._labeled_idx = max(0, min(self._labeled_idx, len(self._labeled) - 1))
+        return self._labeled[self._labeled_idx][0]
+
+    def _current_labeled_class(self) -> str | None:
+        if self._review_mode != "labeled" or not self._labeled:
+            return None
+        self._labeled_idx = max(0, min(self._labeled_idx, len(self._labeled) - 1))
+        return self._labeled[self._labeled_idx][1]
 
     def _show_current(self, sync_list: bool = True) -> None:
         self._pred_label = None
         self._pred_conf = 0.0
-        if not self._pending:
-            self.char_view.setText("没有待审核\n去「截图切字」继续")
-            self.review_meta.setText("无待审核")
+        path = self._current_review_path()
+        if path is None:
+            if self._review_mode == "pending":
+                self.char_view.setText("没有待审核\n去「截图切字」继续")
+                self.review_meta.setText("无待审核")
+            elif self._review_mode == "hard":
+                self.char_view.setText("难例队列为空")
+                self.review_meta.setText("无难例")
+            else:
+                self.char_view.setText("还没有已标注样本")
+                self.review_meta.setText("无已标注")
             self.pred_label_ui.setText("预测：—")
             self.btn_confirm.setEnabled(False)
-            self.pending_list.clear()
+            self.context_view.setText("原图对照：无样本")
+            self._highlight_suggested_label(None)
+            self._update_review_progress()
             return
-        self._idx = max(0, min(self._idx, len(self._pending) - 1))
-        if sync_list and self.pending_list.currentRow() != self._idx:
-            self.pending_list.blockSignals(True)
-            self.pending_list.setCurrentRow(self._idx)
-            self.pending_list.blockSignals(False)
 
-        path = self._pending[self._idx]
+        if sync_list:
+            if self._review_mode == "pending":
+                row = self._idx
+            elif self._review_mode == "hard":
+                row = self._hard_idx
+            else:
+                row = self._labeled_idx
+            if self.pending_list.currentRow() != row:
+                self.pending_list.blockSignals(True)
+                self.pending_list.setCurrentRow(row)
+                self.pending_list.blockSignals(False)
+
         raw = path.read_bytes()
         img = cv2.imdecode(np.frombuffer(raw, dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
         if img is None:
@@ -1030,95 +1421,381 @@ class MainWindow(QMainWindow):
             return
         pix = numpy_to_pixmap(img)
         self.char_view.setPixmap(
+            pix.scaled(340, 340, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.FastTransformation)
+        )
+
+        if self._review_mode == "pending":
+            self.review_meta.setText(f"待审 {self._idx + 1} / {len(self._pending)}  ·  {path.name}")
+            self._update_prediction(path)
+        elif self._review_mode == "hard":
+            self.review_meta.setText(f"难例 {self._hard_idx + 1} / {len(self._hard)}  ·  {path.name}")
+            self._update_prediction(path)
+            self.btn_confirm.setText("难例：点数字标注后移入数据集")
+        else:
+            lab = self._current_labeled_class() or "?"
+            self.review_meta.setText(
+                f"已标注 {self._labeled_idx + 1} / {len(self._labeled)}  ·  当前类「{display_label(lab)}」  ·  {path.name}"
+            )
+            self.pred_label_ui.setText(f"当前标签：{display_label(lab)}（可直接改标）")
+            self.pred_label_ui.setStyleSheet("font-size:20px; font-weight:700; color:#2563eb;")
+            self.btn_confirm.setEnabled(False)
+            self.btn_confirm.setText("已标注模式：点数字即可改标")
+            self._highlight_suggested_label(lab)
+        self._update_context_view(path)
+        self._update_review_progress()
+
+    def _update_context_view(self, path: Path) -> None:
+        if not self.project:
+            self.context_view.setText("原图对照：无项目")
+            return
+        meta = get_meta(self.project, path.name)
+        if not meta:
+            self.context_view.setText("原图对照：无来源信息（旧样本可忽略）")
+            return
+        src = resolve_source(self.project, meta)
+        box = meta.get("box")
+        line_box = meta.get("line_box") or box
+        if not src or not box or not line_box:
+            self.context_view.setText("原图对照：找不到源截图")
+            return
+        try:
+            bgr = load_bgr(src)
+        except Exception:
+            self.context_view.setText("原图对照：源图读取失败")
+            return
+        lx, ly, lw, lh = [int(v) for v in line_box]
+        pad = 12
+        H, W = bgr.shape[:2]
+        x0 = max(0, lx - pad)
+        y0 = max(0, ly - pad)
+        x1 = min(W, lx + lw + pad)
+        y1 = min(H, ly + lh + pad)
+        strip = bgr[y0:y1, x0:x1].copy()
+        bx, by, bw, bh = [int(v) for v in box]
+        # highlight relative to strip
+        rx, ry = bx - x0, by - y0
+        cv2.rectangle(strip, (rx, ry), (rx + bw, ry + bh), (0, 220, 80), 2)
+        pix = numpy_to_pixmap(strip)
+        self.context_view.setPixmap(
             pix.scaled(
-                340,
-                340,
+                max(self.context_view.width(), 480),
+                150,
                 Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.FastTransformation,
+                Qt.TransformationMode.SmoothTransformation,
             )
         )
-        self.review_meta.setText(f"当前第 {self._idx + 1} / {len(self._pending)}  ·  {path.name}")
 
-        if self.project:
-            ckpt = latest_checkpoint(self.project)
-            if ckpt:
-                try:
-                    lab, conf = predict_pending_file(
-                        ckpt,
-                        path,
-                        self.project.config.classes,
-                        self.project.config.input_width,
-                        self.project.config.input_height,
-                    )
-                    self._pred_label = lab
-                    self._pred_conf = conf
-                    shown = display_label(lab)
-                    self.pred_label_ui.setText(f"预测 {shown}  ·  {conf:.0%}")
-                    color = "#059669" if conf >= 0.8 else "#d97706"
-                    self.pred_label_ui.setStyleSheet(
-                        f"font-size:22px; font-weight:700; color:{color};"
-                    )
-                    self.btn_confirm.setEnabled(True)
-                    self.btn_confirm.setText(f"空格：确认「{shown}」")
-                except Exception:
-                    self.pred_label_ui.setText("预测失败")
-                    self.btn_confirm.setEnabled(False)
-            else:
-                self.pred_label_ui.setText("尚无模型 · 先手动标一些再训练")
-                self.btn_confirm.setEnabled(False)
-                self.btn_confirm.setText("空格确认（需先训练）")
+    def _update_prediction(self, path: Path) -> None:
+        if not self.project:
+            return
+        ckpt = latest_checkpoint(self.project)
+        if not ckpt:
+            self.pred_label_ui.setText("尚无模型 · 先手动标一些再训练")
+            self.btn_confirm.setEnabled(False)
+            self.btn_confirm.setText("空格确认（需先训练）")
+            self._highlight_suggested_label(None)
+            return
+        try:
+            lab, conf = predict_pending_file(
+                ckpt,
+                path,
+                self.project.config.classes,
+                self.project.config.input_width,
+                self.project.config.input_height,
+            )
+            self._pred_label = lab
+            self._pred_conf = conf
+            shown = display_label(lab)
+            self.pred_label_ui.setText(f"预测 {shown}  ·  {conf:.0%}")
+            color = "#059669" if conf >= 0.8 else "#d97706"
+            self.pred_label_ui.setStyleSheet(f"font-size:22px; font-weight:700; color:{color};")
+            self.btn_confirm.setEnabled(True)
+            self.btn_confirm.setText(f"空格：确认「{shown}」")
+            self._highlight_suggested_label(lab)
+        except Exception:
+            self.pred_label_ui.setText("预测失败")
+            self.btn_confirm.setEnabled(False)
+            self._highlight_suggested_label(None)
 
     def _confirm_prediction(self) -> None:
-        if self._pred_label:
-            self._assign(self._pred_label)
+        if self._review_mode != "pending":
+            return
+        if not self._pred_label:
+            return
+        if hasattr(self, "batch_stop_label"):
+            self.batch_stop_label.setVisible(False)
+        self._assign(self._pred_label)
+        if not self.chk_batch_confirm.isChecked():
+            return
+        self._batch_confirming = True
+        stopped_reason = ""
+        try:
+            while self._review_mode == "pending" and self._pending:
+                if not self._pred_label:
+                    stopped_reason = "当前无预测，已停下"
+                    break
+                if self._pred_conf < float(self.conf_spin.value()):
+                    stopped_reason = (
+                        f"批量确认已停下：预测「{display_label(self._pred_label)}」"
+                        f"置信度 {self._pred_conf:.0%} < 阈值 {float(self.conf_spin.value()):.0%}，请手标"
+                    )
+                    break
+                self._assign(self._pred_label)
+        finally:
+            self._batch_confirming = False
+        if stopped_reason and hasattr(self, "batch_stop_label"):
+            self.batch_stop_label.setText(stopped_reason)
+            self.batch_stop_label.setVisible(True)
+            self._status.showMessage(stopped_reason)
 
     def _assign(self, label: str) -> None:
         proj = self._require_project()
-        if not proj or not self._pending:
+        if not proj:
+            return
+        if self._review_mode == "labeled":
+            self._relabel_current(label)
+            return
+        if self._review_mode == "hard":
+            if not self._hard:
+                return
+            path = self._hard[self._hard_idx]
+            try:
+                dest = move_to_label(proj, path, label)
+            except Exception as exc:
+                QMessageBox.warning(self, "标注失败", str(exc))
+                return
+            remove_hard_file(proj, path)
+            self._last_labeled_path = dest
+            self._reload_review_lists()
+            self._refresh_project_info()
+            self._status.showMessage(f"难例已标为 {display_label(normalize_label(label))}")
+            return
+        if not self._pending:
             return
         path = self._pending[self._idx]
         try:
-            move_to_label(proj, path, label)
+            dest = move_to_label(proj, path, label)
         except Exception as exc:
             QMessageBox.warning(self, "标注失败", str(exc))
             return
-        # keep index at same position (next item slides up)
+        # 低置信或与预测不一致 → 难例备份
+        try:
+            nl = normalize_label(label)
+            if self._pred_label and (
+                normalize_label(self._pred_label) != nl or self._pred_conf < 0.75
+            ):
+                add_hard_example(
+                    proj,
+                    dest,
+                    reason="低置信或改预测",
+                    pred=self._pred_label,
+                    conf=self._pred_conf,
+                    expected=nl,
+                )
+        except Exception:
+            pass
+        self._undo_stack.append(
+            {
+                "action": "label",
+                "dest": dest,
+                "label": normalize_label(label),
+                "pending_name": path.name,
+            }
+        )
+        self._last_labeled_path = dest
         self._pending.pop(self._idx)
         if self._idx >= len(self._pending) and self._pending:
             self._idx = len(self._pending) - 1
-        self._rebuild_pending_gallery()
+        self._labeled = list_all_labeled(proj)
+        self._rebuild_gallery()
         if self._pending:
             self.pending_list.blockSignals(True)
             self.pending_list.setCurrentRow(self._idx)
             self.pending_list.blockSignals(False)
         self._show_current(sync_list=False)
         self._refresh_project_info()
-        self._status.showMessage(f"已标为 {display_label(normalize_label(label))}")
+        msg = f"已标为 {display_label(normalize_label(label))} — 标错可点「已标注」改，或 Ctrl+Z /「查看刚标的那张」"
+        if not self._batch_confirming:
+            self._status.showMessage(msg)
+        self._update_review_progress()
+
+    def _relabel_current(self, label: str) -> None:
+        proj = self._require_project()
+        path = self._current_review_path()
+        if not proj or not path:
+            return
+        old_lab = self._current_labeled_class()
+        try:
+            dest = relabel_dataset_file(proj, path, label)
+        except Exception as exc:
+            QMessageBox.warning(self, "改标失败", str(exc))
+            return
+        self._undo_stack.append(
+            {
+                "action": "relabel",
+                "dest": dest,
+                "label": normalize_label(label),
+                "old_label": old_lab,
+            }
+        )
+        self._labeled = list_all_labeled(proj)
+        # stay on same logical item by finding dest
+        for i, (p, _) in enumerate(self._labeled):
+            if p == dest:
+                self._labeled_idx = i
+                break
+        self._rebuild_gallery()
+        self.pending_list.blockSignals(True)
+        self.pending_list.setCurrentRow(self._labeled_idx)
+        self.pending_list.blockSignals(False)
+        self._show_current(sync_list=False)
+        self._refresh_project_info()
+        self._last_labeled_path = dest
+        try:
+            add_hard_example(proj, dest, reason="人工改标", expected=normalize_label(label), pred=old_lab)
+        except Exception:
+            pass
+        self._status.showMessage(f"已改标为 {display_label(normalize_label(label))}")
+
+    def _return_current_to_pending(self) -> None:
+        proj = self._require_project()
+        if not proj:
+            return
+        if self._review_mode != "labeled":
+            QMessageBox.information(self, "提示", "请先切换到「已标注（可改）」再退回待审")
+            self._set_review_mode("labeled")
+            return
+        path = self._current_review_path()
+        if not path:
+            return
+        old_lab = self._current_labeled_class()
+        try:
+            dest = move_to_pending(proj, path)
+        except Exception as exc:
+            QMessageBox.warning(self, "退回失败", str(exc))
+            return
+        self._undo_stack.append(
+            {"action": "return", "dest": dest, "old_label": old_lab}
+        )
+        self._review_mode = "pending"
+        self._reload_review_lists()
+        self.btn_rev_pending.setObjectName("primaryBtn")
+        self.btn_rev_labeled.setObjectName("")
+        for b in (self.btn_rev_pending, self.btn_rev_labeled):
+            b.style().unpolish(b)
+            b.style().polish(b)
+        self.gallery_title.setText("待审预览（点击选择）")
+        self._status.showMessage("已退回待审，可重新标注")
+
+    def _undo_last_label(self) -> None:
+        proj = self._require_project()
+        if not proj or not self._undo_stack:
+            self._status.showMessage("没有可撤销的操作")
+            return
+        item = self._undo_stack.pop()
+        action = item.get("action")
+        next_mode = self._review_mode
+        try:
+            if action == "label":
+                dest: Path = item["dest"]
+                if dest.exists():
+                    move_to_pending(proj, dest)
+                next_mode = "pending"
+                self._status.showMessage("已撤销上一标注，样本回到待审")
+            elif action == "relabel":
+                dest = item["dest"]
+                old = item.get("old_label")
+                if dest.exists() and old:
+                    relabel_dataset_file(proj, dest, old)
+                next_mode = "labeled"
+                self._status.showMessage("已撤销改标")
+            elif action == "return":
+                dest = item["dest"]
+                old = item.get("old_label")
+                if dest.exists() and old:
+                    move_to_label(proj, dest, old)
+                next_mode = "labeled"
+                self._status.showMessage("已撤销退回待审")
+            else:
+                self._status.showMessage("无法撤销该操作")
+                return
+        except Exception as exc:
+            QMessageBox.warning(self, "撤销失败", str(exc))
+            return
+        # 直接设模式再刷新，避免 _set_review_mode 重复 reload
+        self._review_mode = next_mode
+        if next_mode == "pending":
+            self.gallery_title.setText("待审预览（点击选择）")
+            self.btn_rev_pending.setObjectName("primaryBtn")
+            self.btn_rev_labeled.setObjectName("")
+        else:
+            self.gallery_title.setText("已标注（点选后可改标/退回）")
+            self.btn_rev_labeled.setObjectName("primaryBtn")
+            self.btn_rev_pending.setObjectName("")
+        for b in (self.btn_rev_pending, self.btn_rev_labeled):
+            b.style().unpolish(b)
+            b.style().polish(b)
+        self._reload_review_lists()
+        self._refresh_project_info()
 
     def _delete_current(self) -> None:
-        if not self._pending:
+        path = self._current_review_path()
+        if not path:
             return
-        path = self._pending[self._idx]
-        path.unlink(missing_ok=True)
-        self._pending.pop(self._idx)
-        if self._idx >= len(self._pending) and self._pending:
-            self._idx = len(self._pending) - 1
-        self._rebuild_pending_gallery()
-        if self._pending:
-            self.pending_list.blockSignals(True)
-            self.pending_list.setCurrentRow(self._idx)
-            self.pending_list.blockSignals(False)
-        self._show_current(sync_list=False)
+        if self._review_mode in ("labeled", "hard"):
+            reply = QMessageBox.question(
+                self,
+                "确认删除",
+                f"删除样本？\n{path.name}\n（不可撤销）",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+        if self._review_mode == "hard" and self.project:
+            remove_hard_file(self.project, path)
+            self._hard = list_hard_files(self.project)
+            if self._hard_idx >= len(self._hard) and self._hard:
+                self._hard_idx = len(self._hard) - 1
+        else:
+            path.unlink(missing_ok=True)
+            if self._review_mode == "pending":
+                self._pending.pop(self._idx)
+                if self._idx >= len(self._pending) and self._pending:
+                    self._idx = len(self._pending) - 1
+            else:
+                self._labeled.pop(self._labeled_idx)
+                if self._labeled_idx >= len(self._labeled) and self._labeled:
+                    self._labeled_idx = len(self._labeled) - 1
+        self._rebuild_gallery()
+        self._show_current(sync_list=True)
         self._update_header()
+        self._refresh_project_info()
 
     def _next_pending(self) -> None:
-        if self._pending:
-            self._idx = min(self._idx + 1, len(self._pending) - 1)
+        if self._review_mode == "pending":
+            if self._pending:
+                self._idx = min(self._idx + 1, len(self._pending) - 1)
+                self._show_current()
+        elif self._review_mode == "hard":
+            if self._hard:
+                self._hard_idx = min(self._hard_idx + 1, len(self._hard) - 1)
+                self._show_current()
+        elif self._labeled:
+            self._labeled_idx = min(self._labeled_idx + 1, len(self._labeled) - 1)
             self._show_current()
 
     def _prev_pending(self) -> None:
-        if self._pending:
-            self._idx = max(self._idx - 1, 0)
+        if self._review_mode == "pending":
+            if self._pending:
+                self._idx = max(self._idx - 1, 0)
+                self._show_current()
+        elif self._review_mode == "hard":
+            if self._hard:
+                self._hard_idx = max(self._hard_idx - 1, 0)
+                self._show_current()
+        elif self._labeled:
+            self._labeled_idx = max(self._labeled_idx - 1, 0)
             self._show_current()
 
     # ---------- dataset ----------
@@ -1191,6 +1868,15 @@ class MainWindow(QMainWindow):
         path = self._current_ds_path()
         if not path:
             return
+        reply = QMessageBox.question(
+            self,
+            "确认删除",
+            f"删除样本 {path.name}？（不可撤销）",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
         path.unlink(missing_ok=True)
         self._reload_dataset_browser()
         self._refresh_project_info()
@@ -1208,8 +1894,23 @@ class MainWindow(QMainWindow):
         if total < 10:
             QMessageBox.warning(self, "提示", f"样本太少（{total}），建议先多标一些")
             return
+        warns = balance_warnings(counts)
+        if warns:
+            detail = "\n".join(f"· {w}" for w in warns)
+            reply = QMessageBox.question(
+                self,
+                "类别均衡提示",
+                f"检测到可能影响效果的问题：\n{detail}\n\n仍要开始训练吗？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+        augment = self.chk_augment.isChecked()
+        proj.config.augment = augment
+        proj.save_config()
         self.train_log.clear()
-        self._worker = TrainWorker(proj, self.epochs_spin.value())
+        self._worker = TrainWorker(proj, self.epochs_spin.value(), augment=augment)
         self._worker.log.connect(lambda m: self.train_log.append(m))
         self._worker.done.connect(self._train_done)
         self._worker.failed.connect(lambda e: QMessageBox.critical(self, "训练失败", e))
@@ -1218,23 +1919,92 @@ class MainWindow(QMainWindow):
     def _train_done(self, path: str) -> None:
         self.train_log.append(f"完成: {path}")
         self._refresh_project_info()
-        QMessageBox.information(self, "完成", "训练完成。回审核页可用空格快速确认。")
-        self.tabs.setCurrentIndex(self.TAB_REVIEW)
+        self._refresh_train_curve()
+        QMessageBox.information(
+            self,
+            "完成",
+            "训练完成。回切字页点「预览识别」可看整行读数；审核页可空格批量确认。",
+        )
+        self.tabs.setCurrentIndex(self.TAB_WORK)
+
+    def _refresh_train_curve(self) -> None:
+        if not hasattr(self, "curve_label") or not self.project:
+            return
+        runs = sorted(self.project.runs_dir.glob("*/metrics.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if not runs:
+            self.curve_label.setText("训练曲线：尚无")
+            return
+        import json
+
+        try:
+            data = json.loads(runs[0].read_text(encoding="utf-8"))
+            hist = data.get("history") or []
+        except Exception:
+            self.curve_label.setText("训练曲线：读取失败")
+            return
+        if not hist:
+            return
+        lines = ["训练曲线（最近一次）:"]
+        for h in hist[-8:]:
+            bar = "█" * max(1, int(float(h.get("val_acc", 0)) * 20))
+            lines.append(
+                f"  ep{h.get('epoch')}: loss={float(h.get('loss', 0)):.3f}  "
+                f"val={float(h.get('val_acc', 0)):.0%} {bar}"
+            )
+        best = data.get("best_val_acc")
+        if best is not None:
+            lines.append(f"最佳 val_acc={float(best):.1%}")
+        self.curve_label.setText("\n".join(lines))
 
     def _export(self) -> None:
         proj = self._require_project()
         if not proj:
             return
+        ok, msg = check_onnx_dependency()
+        self._update_export_dep_hint()
+        if not ok:
+            QMessageBox.warning(self, "缺少依赖", msg)
+            return
         ckpt = latest_checkpoint(proj)
         if not ckpt:
             QMessageBox.warning(self, "提示", "请先训练")
             return
+        errors, warnings = export_quality_report(proj, ckpt)
+        force = hasattr(self, "chk_force_export") and self.chk_force_export.isChecked()
+        if errors and not force:
+            QMessageBox.warning(
+                self,
+                "质量门禁未通过",
+                "\n".join(f"· {e}" for e in errors)
+                + "\n\n可勾选「强制导出」跳过，或先补样本/再训练。",
+            )
+            return
+        if warnings or (errors and force):
+            detail = "\n".join(f"· {w}" for w in (errors + warnings))
+            reply = QMessageBox.question(
+                self,
+                "导出确认",
+                f"{detail}\n\n仍要导出吗？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
         try:
             out = export_onnx(proj, ckpt)
+            verify_msg = verify_onnx_runtime(
+                out,
+                width=proj.config.input_width,
+                height=proj.config.input_height,
+            )
         except Exception as exc:
             QMessageBox.critical(self, "导出失败", f"{exc}\n{traceback.format_exc()}")
             return
-        QMessageBox.information(self, "已导出", f"{out.parent}")
+        QMessageBox.information(
+            self,
+            "已导出",
+            f"{out.parent}\n\n{verify_msg}\n\n拷到 Studio models/ 见 docs/studio-recognize-digits.md",
+        )
 
     def _open_export_dir(self) -> None:
         proj = self._require_project()
@@ -1242,6 +2012,495 @@ class MainWindow(QMainWindow):
             return
         proj.exports_dir.mkdir(parents=True, exist_ok=True)
         os.startfile(proj.exports_dir)  # noqa: S606
+
+    def _copy_export_path(self) -> None:
+        proj = self._require_project()
+        if not proj:
+            return
+        proj.exports_dir.mkdir(parents=True, exist_ok=True)
+        QApplication.clipboard().setText(str(proj.exports_dir.resolve()))
+        self._status.showMessage(f"已复制导出路径: {proj.exports_dir}")
+
+    def _update_export_dep_hint(self) -> None:
+        if not hasattr(self, "export_dep_label"):
+            return
+        ok, msg = check_onnx_dependency()
+        self.export_dep_label.setText("导出依赖 OK" if ok else msg)
+        self.export_dep_label.setStyleSheet(
+            "color:#059669;" if ok else "color:#dc2626; font-weight:600;"
+        )
+
+    def _persist_confirm_threshold(self, value: float) -> None:
+        if not self.project:
+            return
+        self.project.config.confirm_threshold = float(value)
+        self.project.save_config()
+        update_prefs(confirm_threshold=float(value))
+
+    def _persist_augment(self, _state: int = 0) -> None:
+        if not self.project:
+            return
+        self.project.config.augment = self.chk_augment.isChecked()
+        self.project.save_config()
+
+    def _reload_roi_preset_combo(self) -> None:
+        if not hasattr(self, "roi_preset_combo"):
+            return
+        self.roi_preset_combo.blockSignals(True)
+        self.roi_preset_combo.clear()
+        if self.project:
+            for p in self.project.config.roi_presets:
+                self.roi_preset_combo.addItem(f"{p.name} ({p.w}x{p.h})", p.name)
+        self.roi_preset_combo.blockSignals(False)
+        name = self._ui_prefs.get("last_roi_preset")
+        if name:
+            idx = self.roi_preset_combo.findData(name)
+            if idx >= 0:
+                self.roi_preset_combo.setCurrentIndex(idx)
+
+    def _save_roi_preset(self) -> None:
+        proj = self._require_project()
+        if not proj:
+            return
+        roi = self.import_canvas.roi()
+        if not roi:
+            QMessageBox.information(self, "提示", "请先拖一个蓝框（框整行模式）")
+            return
+        name, ok = QInputDialog.getText(self, "保存 ROI 预设", "名称（如：金币行）")
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+        x, y, w, h = roi
+        presets = [p for p in proj.config.roi_presets if p.name != name]
+        presets.append(RoiPreset(name=name, x=x, y=y, w=w, h=h))
+        proj.config.roi_presets = presets
+        proj.save_config()
+        self._reload_roi_preset_combo()
+        idx = self.roi_preset_combo.findData(name)
+        if idx >= 0:
+            self.roi_preset_combo.setCurrentIndex(idx)
+        update_prefs(last_roi_preset=name)
+        self._status.showMessage(f"已保存 ROI 预设「{name}」")
+
+    def _apply_roi_preset(self) -> None:
+        proj = self._require_project()
+        if not proj:
+            return
+        name = self.roi_preset_combo.currentData()
+        preset = next((p for p in proj.config.roi_presets if p.name == name), None)
+        if not preset:
+            QMessageBox.information(self, "提示", "没有可选预设")
+            return
+        self._set_cut_mode("roi")
+        self.import_canvas.set_roi((preset.x, preset.y, preset.w, preset.h))
+        self._last_roi = (preset.x, preset.y, preset.w, preset.h)
+        update_prefs(last_roi_preset=preset.name, last_roi=list(self._last_roi))
+        self._status.showMessage(f"已套用 ROI「{preset.name}」— 可再自动预览切字或改手动框")
+
+    def _delete_roi_preset(self) -> None:
+        proj = self._require_project()
+        if not proj:
+            return
+        name = self.roi_preset_combo.currentData()
+        if not name:
+            return
+        proj.config.roi_presets = [p for p in proj.config.roi_presets if p.name != name]
+        proj.save_config()
+        self._reload_roi_preset_combo()
+        self._status.showMessage(f"已删除预设「{name}」")
+
+    def _trial_infer_boxes(self) -> None:
+        self._preview_recognize()
+
+    def _preview_recognize_silent(self) -> None:
+        try:
+            self._preview_recognize(silent=True)
+        except Exception:
+            pass
+
+    def _preview_recognize(self, silent: bool = False) -> None:
+        proj = self._require_project()
+        if not proj:
+            return
+        ckpt = latest_checkpoint(proj)
+        if not ckpt:
+            if not silent:
+                QMessageBox.information(self, "提示", "请先训练模型再预览识别")
+            if hasattr(self, "preview_big"):
+                self.preview_big.setText("识别预览：需先训练")
+            return
+        if not self._current_import:
+            if not silent:
+                QMessageBox.information(self, "提示", "请先打开一张截图")
+            return
+        boxes = self.import_canvas.boxes()
+        if not boxes:
+            if not silent:
+                self._auto_preview_boxes()
+                boxes = self.import_canvas.boxes()
+        if not boxes:
+            if not silent:
+                QMessageBox.warning(self, "提示", "请先框出字框")
+            return
+        try:
+            bgr = load_bgr(self._current_import)
+            text, parts = predict_boxes_string(
+                proj,
+                bgr,
+                boxes,
+                ckpt,
+                conf_threshold=float(self.conf_spin.value()) if hasattr(self, "conf_spin") else 0.5,
+            )
+        except Exception as exc:
+            if not silent:
+                QMessageBox.critical(self, "预览失败", str(exc))
+            return
+        self.import_canvas.set_predictions(parts)
+        if hasattr(self, "preview_big"):
+            self.preview_big.setText(text or "（空）")
+        detail = " ".join(f"{display_label(l)}({c:.0%})" for l, c in parts)
+        self.trial_result.setText(f"预览明细：{detail}")
+        if not silent:
+            self._status.showMessage(f"识别预览：{text}")
+
+    def _split_selected_box(self) -> None:
+        if not self.import_canvas.split_selected_box_vertical():
+            QMessageBox.information(self, "提示", "请先点选一个较宽的绿框，再拆粘连")
+            return
+        self._status.showMessage("已拆成两个字框，可再预览识别")
+        self._preview_timer.start(300)
+
+    def _capture_ld_window(self) -> None:
+        dest = self._capture_dest_dir()
+        if not dest:
+            return
+        title, ok = QInputDialog.getText(
+            self, "窗口截图", "窗口标题包含：", text="雷电"
+        )
+        if not ok:
+            return
+        try:
+            path = capture_window_by_title(dest, title.strip() or "雷电")
+        except Exception as exc:
+            QMessageBox.critical(self, "窗口截图失败", str(exc))
+            return
+        self._add_captured_path(path, apply_last_roi=bool(self._last_roi))
+
+    def _multi_roi_sample(self) -> None:
+        proj = self._require_project()
+        if not proj:
+            return
+        presets = list(proj.config.roi_presets)
+        if not presets:
+            QMessageBox.information(self, "提示", "请先在「更多」里保存多个 ROI 预设")
+            return
+        dest = self._capture_dest_dir()
+        if not dest:
+            return
+        try:
+            path = capture_adb(dest)
+        except Exception as exc:
+            QMessageBox.warning(
+                self,
+                "ADB 失败",
+                f"{exc}\n\n将使用当前图做多 ROI 切字（若已打开截图）",
+            )
+            path = self._current_import
+            if not path:
+                return
+        self._add_captured_path(path)
+        QApplication.processEvents()
+        total = 0
+        try:
+            bgr = load_bgr(path)
+        except Exception as exc:
+            QMessageBox.critical(self, "读图失败", str(exc))
+            return
+        for preset in presets:
+            boxes = []
+            # auto segment inside each ROI
+            try:
+                _, crops, _ = segment_image(
+                    path,
+                    proj.config.preprocess,
+                    roi=(preset.x, preset.y, preset.w, preset.h),
+                    max_gap=self.gap_spin.value(),
+                )
+                if crops:
+                    # convert to full-image boxes
+                    boxes = [(c.x + preset.x, c.y + preset.y, c.w, c.h) for c in crops]
+                else:
+                    boxes = [(preset.x, preset.y, preset.w, preset.h)]
+                crops2 = crops_from_full_boxes(bgr, boxes, proj.config.preprocess)
+                paths = save_pending_chars(proj, path, crops2)
+                total += len(paths)
+            except Exception:
+                continue
+        self._reload_pending()
+        self._refresh_project_info()
+        self.tabs.setCurrentIndex(self.TAB_REVIEW)
+        self._status.showMessage(f"多 ROI 刷样完成：共切出 {total} 个字")
+
+    def _gold_compare_reflow(self) -> None:
+        proj = self._require_project()
+        if not proj:
+            return
+        raw = self.gold_edit.text().strip()
+        if not raw:
+            QMessageBox.information(self, "提示", "请先填写金标，例如 1234万")
+            return
+        preds = self.import_canvas.predictions()
+        if not preds:
+            self._preview_recognize()
+            preds = self.import_canvas.predictions()
+        if not preds:
+            return
+        try:
+            expected = tokenize_expected(raw, proj.config.classes)
+        except Exception as exc:
+            QMessageBox.warning(self, "金标无效", str(exc))
+            return
+        mismatches = compare_preds(expected, preds)
+        if not mismatches:
+            QMessageBox.information(self, "对比通过", f"与金标一致：{raw}")
+            return
+        boxes = self.import_canvas.boxes()
+        if not self._current_import:
+            return
+        bgr = load_bgr(self._current_import)
+        crop_list = []
+        meta_mm = []
+        for m in mismatches:
+            i = int(m["index"])
+            if i >= len(boxes):
+                continue
+            crops = crops_from_full_boxes(bgr, [boxes[i]], proj.config.preprocess)
+            if not crops:
+                continue
+            crop_list.extend(crops)
+            meta_mm.append(m)
+        if not crop_list:
+            QMessageBox.warning(self, "回流失败", "无法切出不符的字框")
+            return
+        paths = save_pending_chars(proj, self._current_import, crop_list)
+        for p, m in zip(paths, meta_mm):
+            add_hard_example(
+                proj,
+                p,
+                reason="金标不符",
+                pred=m.get("pred"),
+                conf=m.get("conf"),
+                expected=m.get("expected"),
+            )
+        n_added = len(paths)
+        self._reload_pending()
+        self._refresh_project_info()
+        QMessageBox.information(
+            self,
+            "已回流",
+            f"发现 {len(mismatches)} 处不符，已加入待审/难例 {n_added} 张。\n可去审核页继续标。",
+        )
+        self.tabs.setCurrentIndex(self.TAB_REVIEW)
+        self._set_review_mode("hard")
+
+    def _jump_to_last_labeled(self) -> None:
+        if not self.project or not self._last_labeled_path:
+            self._status.showMessage("还没有刚标注的样本")
+            return
+        target = self._last_labeled_path
+        if not target.exists():
+            # maybe renamed — match by name in labeled list
+            self._set_review_mode("labeled")
+            for i, (p, _) in enumerate(self._labeled):
+                if p.name == target.name:
+                    self._labeled_idx = i
+                    self._show_current()
+                    return
+            self._status.showMessage("刚标的样本找不到了（可能已删除）")
+            return
+        self._set_review_mode("labeled")
+        for i, (p, _) in enumerate(self._labeled):
+            if p == target or p.name == target.name:
+                self._labeled_idx = i
+                self._show_current()
+                self._status.showMessage(f"已跳到刚标：{display_label(self._labeled[i][1])}")
+                return
+        self._status.showMessage("刚标的样本不在列表中")
+
+    # ---------- UX helpers ----------
+    def _bootstrap_ui_prefs(self) -> None:
+        prefs = self._ui_prefs
+        geo = prefs.get("geometry")
+        if geo:
+            try:
+                self.restoreGeometry(QByteArray.fromHex(str(geo).encode("ascii")))
+            except Exception:
+                pass
+        self._try_autoload_last_project()
+        mode = prefs.get("cut_mode") or "char"
+        if mode in ("char", "roi"):
+            self._set_cut_mode(mode)
+        last_roi = prefs.get("last_roi")
+        if isinstance(last_roi, list) and len(last_roi) == 4:
+            try:
+                self._last_roi = tuple(int(v) for v in last_roi)  # type: ignore[assignment]
+            except (TypeError, ValueError):
+                pass
+        if prefs.get("work_more_open") and hasattr(self, "btn_more"):
+            self.btn_more.setChecked(True)
+        sizes = prefs.get("work_splitter")
+        if sizes and hasattr(self, "work_splitter"):
+            try:
+                self.work_splitter.setSizes([int(x) for x in sizes])
+            except Exception:
+                pass
+        if not prefs.get("guide_done"):
+            self._guide_step = 0
+            self._update_guide_banner()
+            self.guide_banner.setVisible(True)
+        else:
+            self.guide_banner.setVisible(False)
+        self._update_export_dep_hint()
+
+    def closeEvent(self, event) -> None:  # noqa: N802
+        self._persist_ui_prefs()
+        super().closeEvent(event)
+
+    def _persist_ui_prefs(self) -> None:
+        payload = {
+            "geometry": bytes(self.saveGeometry().toHex()).decode("ascii"),
+            "cut_mode": self.import_canvas.mode() if hasattr(self, "import_canvas") else "char",
+            "guide_done": bool(self._ui_prefs.get("guide_done")),
+            "work_more_open": bool(getattr(self, "btn_more", None) and self.btn_more.isChecked()),
+        }
+        if self._last_roi:
+            payload["last_roi"] = list(self._last_roi)
+        if hasattr(self, "work_splitter"):
+            payload["work_splitter"] = self.work_splitter.sizes()
+        if self.project:
+            payload["last_roi_preset"] = self.roi_preset_combo.currentData()
+            payload["confirm_threshold"] = float(self.conf_spin.value())
+        self._ui_prefs = update_prefs(**payload)
+
+    def _toggle_work_more(self, checked: bool) -> None:
+        self.work_more.setVisible(checked)
+        self.btn_more.setText("更多 ▴" if checked else "更多 ▾")
+        update_prefs(work_more_open=checked)
+
+    def _undo_contextual(self) -> None:
+        idx = self.tabs.currentIndex()
+        if idx == self.TAB_WORK:
+            self._undo_char_box()
+        elif idx == self.TAB_REVIEW:
+            self._undo_last_label()
+
+    def _enter_contextual(self) -> None:
+        if self.tabs.currentIndex() == self.TAB_WORK:
+            self._segment_current()
+        elif self.tabs.currentIndex() == self.TAB_REVIEW:
+            self._confirm_prediction()
+
+    def _highlight_suggested_label(self, label: str | None) -> None:
+        for b in self._digit_btns.values():
+            b.setObjectName("digitBtn")
+            b.style().unpolish(b)
+            b.style().polish(b)
+        for b in self._unit_btns.values():
+            b.setObjectName("unitBtn")
+            b.style().unpolish(b)
+            b.style().polish(b)
+        if not label:
+            return
+        key = normalize_label(label) if label else ""
+        # map wan/yi folder names back
+        from game_digit_trainer.labels import UNIT_CLASS_NAMES
+
+        btn = self._digit_btns.get(key) or self._unit_btns.get(label)
+        if btn is None and key in UNIT_CLASS_NAMES:
+            # display 万/亿 buttons keyed by 万/亿
+            for lab, b in self._unit_btns.items():
+                if normalize_label(lab) == key:
+                    btn = b
+                    break
+        if btn is None:
+            # try display match
+            for lab, b in list(self._digit_btns.items()) + list(self._unit_btns.items()):
+                if normalize_label(lab) == key or display_label(key) == lab:
+                    btn = b
+                    break
+        if btn is not None:
+            btn.setObjectName("suggestedBtn")
+            btn.style().unpolish(btn)
+            btn.style().polish(btn)
+
+    def _update_review_progress(self) -> None:
+        if not hasattr(self, "review_progress") or not self.project:
+            return
+        labeled_n = sum(self.project.class_counts().values())
+        pending_n = len(self.project.pending_files())
+        total = labeled_n + pending_n
+        self.review_progress.setMaximum(max(total, 1))
+        self.review_progress.setValue(labeled_n)
+        self.review_progress.setFormat(f"已标 {labeled_n} / 共 {total}（待审 {pending_n}）")
+
+    def _guide_next(self) -> None:
+        self._guide_step += 1
+        if self._guide_step >= 3:
+            self._guide_skip()
+            return
+        self._update_guide_banner()
+        if self._guide_step == 1:
+            self.tabs.setCurrentIndex(self.TAB_WORK)
+        elif self._guide_step == 2:
+            self.tabs.setCurrentIndex(self.TAB_REVIEW)
+
+    def _guide_skip(self) -> None:
+        self.guide_banner.setVisible(False)
+        self._ui_prefs = update_prefs(guide_done=True)
+
+    def _update_guide_banner(self) -> None:
+        steps = [
+            "① 点「框选截屏 F2」截取游戏数字区域（截完会自动进入框字）",
+            "② 每个数字拖一个绿框（可拖角微调）→ 按 Enter「确认切字」",
+            "③ 到审核页：空格确认预测，或按数字键标注；标错可改",
+        ]
+        step = max(0, min(self._guide_step, len(steps) - 1))
+        self.guide_label.setText(f"快速上手（{step + 1}/3）：{steps[step]}")
+
+    def _recapture_same_roi(self) -> None:
+        """优先 ADB；失败则提示用 F2。截完套用上次 ROI。"""
+        if not self._last_roi and not (self.project and self.project.config.roi_presets):
+            QMessageBox.information(
+                self,
+                "提示",
+                "还没有可用的 ROI。请先拖一个蓝框，或保存/套用 ROI 预设。",
+            )
+            return
+        if not self._last_roi and self.project and self.project.config.roi_presets:
+            p = self.project.config.roi_presets[0]
+            name = self.roi_preset_combo.currentData()
+            preset = next((x for x in self.project.config.roi_presets if x.name == name), None) or p
+            self._last_roi = (preset.x, preset.y, preset.w, preset.h)
+        # try ADB first for emulator workflow
+        dest = self._capture_dest_dir()
+        if not dest:
+            return
+        try:
+            devices = list_adb_devices()
+            if devices:
+                path = capture_adb(dest)
+                self._add_captured_path(path, apply_last_roi=True)
+                return
+        except Exception:
+            pass
+        QMessageBox.information(
+            self,
+            "再截同 ROI",
+            "未检测到 ADB 设备。请用「框选截屏 F2」截一张，截完会自动套用上次蓝框。",
+        )
+        # mark next region capture to apply roi
+        self._pending_apply_roi = True
+        self._capture_region()
 
 
 def run_gui() -> int:

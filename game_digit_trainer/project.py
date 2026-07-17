@@ -18,6 +18,15 @@ class PreprocessConfig:
 
 
 @dataclass
+class RoiPreset:
+    name: str
+    x: int
+    y: int
+    w: int
+    h: int
+
+
+@dataclass
 class ProjectConfig:
     game_id: str
     classes: list[str] = field(default_factory=lambda: list(DIGIT_CLASSES))
@@ -26,6 +35,9 @@ class ProjectConfig:
     channels: int = 1
     preprocess: PreprocessConfig = field(default_factory=PreprocessConfig)
     created_at: str = ""
+    roi_presets: list[RoiPreset] = field(default_factory=list)
+    confirm_threshold: float = 0.85
+    augment: bool = True
 
     def validate(self) -> ProjectConfig:
         if not self.game_id.strip():
@@ -112,6 +124,7 @@ def create_project(
     *,
     with_symbols: bool = False,
     with_units: bool = False,
+    classes: list[str] | None = None,
 ) -> GameProject:
     safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in game_id.strip())
     if not safe:
@@ -119,8 +132,8 @@ def create_project(
     root = projects_root(base) / safe
     if root.exists() and (root / "config.json").exists():
         raise FileExistsError(f"项目已存在: {root}")
-    classes = build_class_list(with_symbols=with_symbols, with_units=with_units)
-    cfg = ProjectConfig(game_id=safe, classes=classes).validate()
+    use_classes = list(classes) if classes else build_class_list(with_symbols=with_symbols, with_units=with_units)
+    cfg = ProjectConfig(game_id=safe, classes=use_classes).validate()
     root.mkdir(parents=True, exist_ok=True)
     save_config(root / "config.json", cfg)
     proj = GameProject(root)
@@ -161,6 +174,23 @@ def load_config(path: Path) -> ProjectConfig:
         binarize=str(prep_raw.get("binarize", "otsu")),
         color_filter=prep_raw.get("color_filter"),
     )
+    presets_raw = data.get("roi_presets") or []
+    presets: list[RoiPreset] = []
+    for item in presets_raw:
+        if not isinstance(item, dict):
+            continue
+        try:
+            presets.append(
+                RoiPreset(
+                    name=str(item.get("name") or "未命名"),
+                    x=int(item["x"]),
+                    y=int(item["y"]),
+                    w=int(item["w"]),
+                    h=int(item["h"]),
+                )
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
     return ProjectConfig(
         game_id=str(data["game_id"]),
         classes=list(data.get("classes") or DIGIT_CLASSES),
@@ -169,6 +199,9 @@ def load_config(path: Path) -> ProjectConfig:
         channels=int(data.get("channels", 1)),
         preprocess=prep,
         created_at=str(data.get("created_at") or ""),
+        roi_presets=presets,
+        confirm_threshold=float(data.get("confirm_threshold", 0.85)),
+        augment=bool(data.get("augment", True)),
     ).validate()
 
 
@@ -181,6 +214,9 @@ def save_config(path: Path, cfg: ProjectConfig) -> None:
         "channels": cfg.channels,
         "preprocess": asdict(cfg.preprocess),
         "created_at": cfg.created_at,
+        "roi_presets": [asdict(p) for p in cfg.roi_presets],
+        "confirm_threshold": cfg.confirm_threshold,
+        "augment": cfg.augment,
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")

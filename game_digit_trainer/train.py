@@ -13,8 +13,9 @@ from game_digit_trainer.segment import prepare_tensor_image
 
 
 class CharFolderDataset(Dataset):
-    def __init__(self, project: GameProject) -> None:
+    def __init__(self, project: GameProject, *, augment: bool = False) -> None:
         self.project = project
+        self.augment = augment
         self.classes = list(project.config.classes)
         self.class_to_idx = {c: i for i, c in enumerate(self.classes)}
         self.items: list[tuple[Path, int]] = []
@@ -31,12 +32,47 @@ class CharFolderDataset(Dataset):
     def __len__(self) -> int:
         return len(self.items)
 
+    def _augment(self, img: np.ndarray) -> np.ndarray:
+        out = img.copy()
+        # slight brightness / contrast
+        if np.random.rand() < 0.7:
+            alpha = float(np.random.uniform(0.75, 1.25))
+            beta = float(np.random.uniform(-25, 25))
+            out = np.clip(out.astype(np.float32) * alpha + beta, 0, 255).astype(np.uint8)
+        # small shift
+        if np.random.rand() < 0.6:
+            h, w = out.shape[:2]
+            tx = int(np.random.randint(-max(1, w // 8), max(2, w // 8 + 1)))
+            ty = int(np.random.randint(-max(1, h // 8), max(2, h // 8 + 1)))
+            m = np.float32([[1, 0, tx], [0, 1, ty]])
+            out = cv2.warpAffine(out, m, (w, h), borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        # mild scale
+        if np.random.rand() < 0.5:
+            h, w = out.shape[:2]
+            scale = float(np.random.uniform(0.85, 1.15))
+            nh, nw = max(4, int(h * scale)), max(4, int(w * scale))
+            scaled = cv2.resize(out, (nw, nh), interpolation=cv2.INTER_LINEAR)
+            canvas = np.zeros_like(out)
+            y0 = max(0, (h - nh) // 2)
+            x0 = max(0, (w - nw) // 2)
+            y1 = min(h, y0 + nh)
+            x1 = min(w, x0 + nw)
+            canvas[y0:y1, x0:x1] = scaled[: y1 - y0, : x1 - x0]
+            out = canvas
+        # light noise
+        if np.random.rand() < 0.4:
+            noise = np.random.normal(0, 8, out.shape).astype(np.float32)
+            out = np.clip(out.astype(np.float32) + noise, 0, 255).astype(np.uint8)
+        return out
+
     def __getitem__(self, index: int):
         path, label = self.items[index]
         raw = np.fromfile(str(path), dtype=np.uint8)
         img = cv2.imdecode(raw, cv2.IMREAD_GRAYSCALE)
         if img is None:
             raise ValueError(f"无法读取: {path}")
+        if self.augment:
+            img = self._augment(img)
         cfg = self.project.config
         arr = prepare_tensor_image(img, cfg.input_width, cfg.input_height)
         tensor = torch.from_numpy(arr).unsqueeze(0)  # 1xHxW
@@ -50,6 +86,7 @@ def train_project(
     batch_size: int = 32,
     lr: float = 1e-3,
     device: str | None = None,
+    augment: bool | None = None,
     log=None,
 ) -> Path:
     def _log(msg: str) -> None:
@@ -58,15 +95,29 @@ def train_project(
         else:
             print(msg)
 
-    ds = CharFolderDataset(project)
+    use_aug = project.config.augment if augment is None else augment
+    ds = CharFolderDataset(project, augment=False)
     n = len(ds)
     val_n = max(1, int(n * 0.15)) if n >= 20 else 0
     if val_n:
-        train_ds, val_ds = torch.utils.data.random_split(
+        train_base, val_ds = torch.utils.data.random_split(
             ds, [n - val_n, val_n], generator=torch.Generator().manual_seed(42)
         )
     else:
-        train_ds, val_ds = ds, None
+        train_base, val_ds = ds, None
+
+    # Augment only on training indices via wrapper
+    if use_aug:
+        train_ds = CharFolderDataset(project, augment=True)
+        # keep same train indices as split when possible
+        if val_n and hasattr(train_base, "indices"):
+            train_ds = torch.utils.data.Subset(train_ds, list(train_base.indices))  # type: ignore[attr-defined]
+        else:
+            train_ds = train_ds
+        _log("数据增强：开（位移/对比度/缩放/噪声）")
+    else:
+        train_ds = train_base
+        _log("数据增强：关")
 
     loader = DataLoader(train_ds, batch_size=min(batch_size, len(train_ds)), shuffle=True)
     val_loader = (
@@ -86,6 +137,7 @@ def train_project(
     run_dir.mkdir(parents=True, exist_ok=True)
     best_path = run_dir / "best.pt"
     best_acc = -1.0
+    history: list[dict] = []
 
     for epoch in range(1, epochs + 1):
         model.train()
@@ -119,6 +171,14 @@ def train_project(
             val_acc = vc / max(vt, 1)
 
         _log(f"epoch {epoch}/{epochs}  loss={train_loss:.4f}  train_acc={train_acc:.3f}  val_acc={val_acc:.3f}")
+        history.append(
+            {
+                "epoch": epoch,
+                "loss": train_loss,
+                "train_acc": train_acc,
+                "val_acc": val_acc,
+            }
+        )
         if val_acc >= best_acc:
             best_acc = val_acc
             torch.save(
@@ -133,5 +193,11 @@ def train_project(
                 best_path,
             )
 
+    import json
+
+    (run_dir / "metrics.json").write_text(
+        json.dumps({"history": history, "best_val_acc": best_acc}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
     _log(f"最佳模型: {best_path}  val_acc={best_acc:.3f}")
     return best_path
