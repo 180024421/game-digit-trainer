@@ -17,6 +17,7 @@ def build_parser() -> argparse.ArgumentParser:
     c = sub.add_parser("create", help="新建游戏项目")
     c.add_argument("game_id")
     c.add_argument("--symbols", action="store_true", help="启用 , / % :")
+    c.add_argument("--units", action="store_true", help="启用 万/亿")
     c.add_argument("--base", type=Path, default=None, help="projects 父目录，默认 cwd")
 
     s = sub.add_parser("segment", help="对图片切字写入 pending")
@@ -49,7 +50,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "create":
         from game_digit_trainer.project import create_project
 
-        proj = create_project(args.game_id, args.base, with_symbols=args.symbols)
+        proj = create_project(
+            args.game_id, args.base, with_symbols=args.symbols, with_units=args.units
+        )
         print(proj.root)
         return 0
 

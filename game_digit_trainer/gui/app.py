@@ -31,12 +31,26 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from game_digit_trainer.capture import (
+    capture_adb,
+    capture_clipboard_bgr,
+    list_adb_devices,
+    qimage_to_bgr,
+    save_bgr,
+)
 from game_digit_trainer.export_onnx import export_onnx, latest_checkpoint
+from game_digit_trainer.gui.region_capture import RegionCaptureOverlay
 from game_digit_trainer.gui.widgets import ImageCanvas, numpy_to_pixmap
 from game_digit_trainer.labels import display_label, normalize_label
 from game_digit_trainer.predict import predict_pending_file
 from game_digit_trainer.preprocess import apply_preprocess, load_bgr
-from game_digit_trainer.project import GameProject, create_project, open_project, projects_root
+from game_digit_trainer.project import (
+    GameProject,
+    create_project,
+    ensure_unit_classes,
+    open_project,
+    projects_root,
+)
 from game_digit_trainer.segment import (
     crop_bgr,
     list_dataset_files,
@@ -111,7 +125,7 @@ class MainWindow(QMainWindow):
     def _build_project(self) -> None:
         layout = QVBoxLayout(self.tab_project)
         tip = QLabel(
-            "流程：新建项目 → 导入截图并框选数字区域 → 切字 → 审核（空格确认预测）→ 训练导出"
+            "流程：新建项目 → 框选截屏/ADB截图 → 框选数字区域切字 → 审核（空格确认）→ 训练导出"
         )
         tip.setWordWrap(True)
         tip.setStyleSheet("color:#555; padding:4px;")
@@ -120,18 +134,24 @@ class MainWindow(QMainWindow):
         row = QHBoxLayout()
         self.game_id_edit = QLineEdit()
         self.game_id_edit.setPlaceholderText("游戏 ID，如 mygame")
-        self.chk_symbols = QCheckBox("启用符号 , / % :")
+        self.chk_symbols = QCheckBox("符号 ,/%:")
+        self.chk_units = QCheckBox("单位 万/亿")
+        self.chk_units.setChecked(True)
         btn_new = QPushButton("新建项目")
         btn_open = QPushButton("打开项目…")
         btn_folder = QPushButton("打开文件夹")
+        btn_add_units = QPushButton("已有项目加万/亿")
         btn_new.clicked.connect(self._new_project)
         btn_open.clicked.connect(self._open_project_dialog)
         btn_folder.clicked.connect(self._open_project_folder)
+        btn_add_units.clicked.connect(self._add_units_to_project)
         row.addWidget(self.game_id_edit, 2)
         row.addWidget(self.chk_symbols)
+        row.addWidget(self.chk_units)
         row.addWidget(btn_new)
         row.addWidget(btn_open)
         row.addWidget(btn_folder)
+        row.addWidget(btn_add_units)
         layout.addLayout(row)
 
         self.project_info = QTextEdit()
@@ -148,10 +168,20 @@ class MainWindow(QMainWindow):
         left_l = QVBoxLayout(left)
         left_l.setContentsMargins(0, 0, 0, 0)
         btn_row = QHBoxLayout()
-        btn_pick = QPushButton("添加截图…")
+        btn_region = QPushButton("框选截屏")
+        btn_region.setStyleSheet("font-weight:600;")
+        btn_adb = QPushButton("ADB截图")
+        btn_paste = QPushButton("粘贴剪贴板")
+        btn_pick = QPushButton("添加文件…")
         btn_clear = QPushButton("清空列表")
+        btn_region.clicked.connect(self._capture_region)
+        btn_adb.clicked.connect(self._capture_adb)
+        btn_paste.clicked.connect(self._capture_clipboard)
         btn_pick.clicked.connect(self._pick_images)
         btn_clear.clicked.connect(self._clear_import_list)
+        btn_row.addWidget(btn_region)
+        btn_row.addWidget(btn_adb)
+        btn_row.addWidget(btn_paste)
         btn_row.addWidget(btn_pick)
         btn_row.addWidget(btn_clear)
         left_l.addLayout(btn_row)
@@ -206,7 +236,7 @@ class MainWindow(QMainWindow):
         right_l.addLayout(actions)
 
         hint = QLabel(
-            "操作：左侧选图 → 在图上拖拽框选金币/血量区域 → 调二值化直到绿框对准每个数字 → 切字"
+            "截图：框选截屏 / ADB（雷电）/ Win+Shift+S 后粘贴。然后在图上再框选数字区域，绿框对准后切字。"
         )
         hint.setWordWrap(True)
         hint.setStyleSheet("color:#666;")
@@ -253,7 +283,14 @@ class MainWindow(QMainWindow):
         layout.addLayout(grid)
 
         sym_row = QHBoxLayout()
-        for text, lab in [("逗号 ,", ","), ("斜杠 /", "/"), ("百分号 %", "%"), ("冒号 :", ":")]:
+        for text, lab in [
+            ("逗号 ,", ","),
+            ("斜杠 /", "/"),
+            ("百分号 %", "%"),
+            ("冒号 :", ":"),
+            ("万 (W)", "万"),
+            ("亿 (Y)", "亿"),
+        ]:
             b = QPushButton(text)
             b.clicked.connect(lambda _=False, d=lab: self._assign(d))
             sym_row.addWidget(b)
@@ -275,8 +312,7 @@ class MainWindow(QMainWindow):
         layout.addLayout(nav)
 
         tip = QLabel(
-            "快捷键：0-9 标注 · 空格确认预测 · ←/→ 翻页 · Delete 删除　"
-            "（有模型后预测会对，多数情况连按空格即可）"
+            "快捷键：0-9 标注 · W=万 · Y=亿 · 空格确认预测 · ←/→ 翻页 · Delete 删除"
         )
         tip.setWordWrap(True)
         tip.setStyleSheet("color:#666;")
@@ -287,6 +323,8 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence(Qt.Key.Key_Delete), self.tab_review, activated=self._delete_current)
         QShortcut(QKeySequence(Qt.Key.Key_Left), self.tab_review, activated=self._prev_pending)
         QShortcut(QKeySequence(Qt.Key.Key_Right), self.tab_review, activated=self._next_pending)
+        QShortcut(QKeySequence("W"), self.tab_review, activated=lambda: self._assign("万"))
+        QShortcut(QKeySequence("Y"), self.tab_review, activated=lambda: self._assign("亿"))
         for d in "0123456789":
             QShortcut(QKeySequence(d), self.tab_review, activated=lambda d=d: self._assign(d))
 
@@ -401,7 +439,11 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "提示", "请填写游戏 ID")
             return
         try:
-            self.project = create_project(gid, with_symbols=self.chk_symbols.isChecked())
+            self.project = create_project(
+                gid,
+                with_symbols=self.chk_symbols.isChecked(),
+                with_units=self.chk_units.isChecked(),
+            )
         except Exception as exc:
             QMessageBox.critical(self, "新建失败", str(exc))
             return
@@ -464,6 +506,99 @@ class MainWindow(QMainWindow):
         self.project_info.setPlainText("\n".join(lines))
 
     # ---------- import ----------
+    def _add_units_to_project(self) -> None:
+        proj = self._require_project()
+        if not proj:
+            return
+        added = ensure_unit_classes(proj)
+        self._refresh_project_info()
+        self._reload_dataset_browser()
+        if added:
+            QMessageBox.information(
+                self,
+                "已添加",
+                f"已加入类别：{', '.join(display_label(x) for x in added)}\n"
+                "审核台可用「万/亿」按钮或 W/Y 键标注。",
+            )
+        else:
+            QMessageBox.information(self, "提示", "本项目已包含万/亿类别")
+
+    def _capture_dest_dir(self) -> Path | None:
+        proj = self._require_project()
+        if not proj:
+            return None
+        proj.raw_dir.mkdir(parents=True, exist_ok=True)
+        return proj.raw_dir
+
+    def _add_captured_path(self, path: Path) -> None:
+        self.import_list.addItem(str(path))
+        self.import_list.setCurrentRow(self.import_list.count() - 1)
+        self._status.showMessage(f"已截取: {path.name}")
+        self.tabs.setCurrentIndex(1)
+
+    def _capture_region(self) -> None:
+        dest = self._capture_dest_dir()
+        if not dest:
+            return
+        # Hide main window so it is not in the shot
+        self.showMinimized()
+        QApplication.processEvents()
+
+        overlay = RegionCaptureOverlay()
+        self._region_overlay = overlay  # keep ref
+
+        def on_captured(qimg) -> None:
+            self.showNormal()
+            self.raise_()
+            try:
+                bgr = qimage_to_bgr(qimg)
+                from game_digit_trainer.capture import _timestamp_name
+
+                path = save_bgr(dest / _timestamp_name("region"), bgr)
+                self._add_captured_path(path)
+            except Exception as exc:
+                QMessageBox.critical(self, "截屏失败", str(exc))
+
+        def on_cancelled() -> None:
+            self.showNormal()
+            self.raise_()
+
+        overlay.captured.connect(on_captured)
+        overlay.cancelled.connect(on_cancelled)
+        overlay.show()
+
+    def _capture_adb(self) -> None:
+        dest = self._capture_dest_dir()
+        if not dest:
+            return
+        try:
+            devices = list_adb_devices()
+            path = capture_adb(dest)
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                "ADB 截图失败",
+                f"{exc}\n\n提示：雷电设置里打开 ADB，或执行 adb connect 127.0.0.1:5555",
+            )
+            return
+        self._add_captured_path(path)
+        if devices:
+            self._status.showMessage(f"ADB 截图成功（{devices[0]}）")
+
+    def _capture_clipboard(self) -> None:
+        dest = self._capture_dest_dir()
+        if not dest:
+            return
+        try:
+            bgr = capture_clipboard_bgr()
+            from game_digit_trainer.capture import _timestamp_name
+
+            path = save_bgr(dest / _timestamp_name("clip"), bgr)
+        except Exception as exc:
+            QMessageBox.warning(self, "粘贴失败", str(exc))
+            return
+        self._add_captured_path(path)
+
     def _clear_import_list(self) -> None:
         self.import_list.clear()
         self._current_import = None

@@ -1,29 +1,30 @@
 from __future__ import annotations
 
-# Display label -> folder / class name
-DEFAULT_CLASSES: list[str] = [
-    "0",
-    "1",
-    "2",
-    "3",
-    "4",
-    "5",
-    "6",
-    "7",
-    "8",
-    "9",
-    "comma",
-    "slash",
-    "percent",
-    "colon",
-]
+# Digits always included
+DIGIT_CLASSES: list[str] = [str(i) for i in range(10)]
 
-# Optional extras beyond digits; enabled by project config
+# Optional punctuation
+SYMBOL_CLASS_NAMES: list[str] = ["comma", "slash", "percent", "colon"]
+
+# Optional Chinese magnitude units (game HUD: 1.2万 / 3亿)
+UNIT_CLASS_NAMES: list[str] = ["wan", "yi"]
+
+# Full catalog (digits + symbols + units)
+DEFAULT_CLASSES: list[str] = DIGIT_CLASSES + SYMBOL_CLASS_NAMES + UNIT_CLASS_NAMES
+
+# Raw / display char -> folder class name
 SYMBOL_CLASSES: dict[str, str] = {
     ",": "comma",
     "/": "slash",
     "%": "percent",
     ":": "colon",
+    "万": "wan",
+    "億": "yi",  # traditional
+    "亿": "yi",
+    "w": "wan",
+    "W": "wan",
+    "y": "yi",
+    "Y": "yi",
 }
 
 DISPLAY_FOR_CLASS: dict[str, str] = {
@@ -31,16 +32,29 @@ DISPLAY_FOR_CLASS: dict[str, str] = {
     "slash": "/",
     "percent": "%",
     "colon": ":",
+    "wan": "万",
+    "yi": "亿",
 }
+
+
+def build_class_list(*, with_symbols: bool = False, with_units: bool = False) -> list[str]:
+    classes = list(DIGIT_CLASSES)
+    if with_symbols:
+        classes.extend(SYMBOL_CLASS_NAMES)
+    if with_units:
+        classes.extend(UNIT_CLASS_NAMES)
+    return classes
 
 
 def normalize_label(raw: str) -> str:
     s = raw.strip()
     if s in SYMBOL_CLASSES:
         return SYMBOL_CLASSES[s]
-    if s in DISPLAY_FOR_CLASS or (len(s) == 1 and s.isdigit()) or s in DEFAULT_CLASSES:
-        if s.isdigit():
-            return s
+    if s in DISPLAY_FOR_CLASS:
+        return s
+    if len(s) == 1 and s.isdigit():
+        return s
+    if s in DEFAULT_CLASSES:
         return s
     raise ValueError(f"未知标签: {raw!r}")
 

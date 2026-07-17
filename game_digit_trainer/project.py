@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from game_digit_trainer.labels import DEFAULT_CLASSES
+from game_digit_trainer.labels import DIGIT_CLASSES, build_class_list, UNIT_CLASS_NAMES
 
 
 @dataclass
@@ -20,7 +20,7 @@ class PreprocessConfig:
 @dataclass
 class ProjectConfig:
     game_id: str
-    classes: list[str] = field(default_factory=lambda: list(DEFAULT_CLASSES[:10]))
+    classes: list[str] = field(default_factory=lambda: list(DIGIT_CLASSES))
     input_width: int = 32
     input_height: int = 32
     channels: int = 1
@@ -111,6 +111,7 @@ def create_project(
     base: Path | None = None,
     *,
     with_symbols: bool = False,
+    with_units: bool = False,
 ) -> GameProject:
     safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in game_id.strip())
     if not safe:
@@ -118,9 +119,7 @@ def create_project(
     root = projects_root(base) / safe
     if root.exists() and (root / "config.json").exists():
         raise FileExistsError(f"项目已存在: {root}")
-    classes = list(DEFAULT_CLASSES[:10])
-    if with_symbols:
-        classes = list(DEFAULT_CLASSES)
+    classes = build_class_list(with_symbols=with_symbols, with_units=with_units)
     cfg = ProjectConfig(game_id=safe, classes=classes).validate()
     root.mkdir(parents=True, exist_ok=True)
     save_config(root / "config.json", cfg)
@@ -128,6 +127,20 @@ def create_project(
     proj._config = cfg
     proj.ensure_dirs()
     return proj
+
+
+def ensure_unit_classes(project: GameProject) -> list[str]:
+    """为已有项目追加 万/亿 类别（若尚未包含）。返回新加入的类名。"""
+    added: list[str] = []
+    cfg = project.config
+    for name in UNIT_CLASS_NAMES:
+        if name not in cfg.classes:
+            cfg.classes.append(name)
+            added.append(name)
+    if added:
+        project.save_config()
+        project.ensure_dirs()
+    return added
 
 
 def open_project(path: Path) -> GameProject:
@@ -150,7 +163,7 @@ def load_config(path: Path) -> ProjectConfig:
     )
     return ProjectConfig(
         game_id=str(data["game_id"]),
-        classes=list(data.get("classes") or DEFAULT_CLASSES[:10]),
+        classes=list(data.get("classes") or DIGIT_CLASSES),
         input_width=int(data.get("input_width", 32)),
         input_height=int(data.get("input_height", 32)),
         channels=int(data.get("channels", 1)),
