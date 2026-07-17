@@ -104,6 +104,32 @@ def predict_boxes_string(
     return text, parts
 
 
+def score_pending_files(
+    checkpoint: Path,
+    paths: list[Path],
+    classes: list[str],
+    width: int,
+    height: int,
+) -> list[tuple[Path, str, float]]:
+    """批量预标待审文件，返回 (path, label, conf)。"""
+    if not paths:
+        return []
+    model, ck_classes, w, h = load_checkpoint(checkpoint)
+    use_classes = ck_classes or classes
+    out: list[tuple[Path, str, float]] = []
+    for pending in paths:
+        try:
+            raw = np.fromfile(str(pending), dtype=np.uint8)
+            img = cv2.imdecode(raw, cv2.IMREAD_GRAYSCALE)
+            if img is None:
+                continue
+            lab, conf = predict_char(model, use_classes, img, w or width, h or height)
+            out.append((pending, lab, conf))
+        except Exception:
+            continue
+    return out
+
+
 def check_onnx_dependency() -> tuple[bool, str]:
     try:
         import onnx  # noqa: F401
@@ -111,3 +137,4 @@ def check_onnx_dependency() -> tuple[bool, str]:
         return True, f"onnx {getattr(onnx, '__version__', '')}"
     except ImportError:
         return False, "未安装 onnx。请运行: pip install onnx onnxscript"
+

@@ -4,9 +4,12 @@ from PyQt6.QtCore import QPoint, QPointF, QRect, QSize, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QCursor, QImage, QPainter, QPen, QPixmap, QWheelEvent
 from PyQt6.QtWidgets import QLabel, QSizePolicy
 
+from game_digit_trainer.box_ops import merge_neighbor_boxes, merge_tiny_boxes
+
 # hit zones for resize
 _HANDLE = ("move", "nw", "n", "ne", "e", "se", "s", "sw", "w")
 _TIP_H = 22  # 顶部提示条高度，图片适配时避开，避免挡住截图顶边
+_MAX_BOX_UNDO = 40
 
 
 def numpy_to_pixmap(gray_or_bgr) -> QPixmap:
@@ -72,8 +75,11 @@ class ImageCanvas(QLabel):
         self._edit_orig: tuple[int, int, int, int] | None = None
         self._creating = False
         self._predictions: list[tuple[str, float]] = []
-        self._hint_roi = "区域模式：拖蓝框框住数字；长按拖移画面；滚轮缩放"
-        self._hint_char = "手动切字：拖新框；点选改大小；长按拖移画面；滚轮缩放"
+        self._interaction_mode = "draw"  # draw | pan
+        self._space_pan = False
+        self._box_undo: list[list[tuple[int, int, int, int]]] = []
+        self._hint_roi = "区域模式：拖蓝框；空格/「拖图」平移；方向键微调选中框"
+        self._hint_char = "手动切字：拖绿框；空格拖图；[ ] 调宽；方向键微调"
         self.setText(self._hint_roi)
 
     def sizeHint(self) -> QSize:  # noqa: N802
@@ -130,13 +136,77 @@ class ImageCanvas(QLabel):
         else:
             self._repaint_canvas()
 
-    def set_boxes(self, boxes: list[tuple[int, int, int, int]]) -> None:
+    def set_boxes(self, boxes: list[tuple[int, int, int, int]], *, push_undo: bool = True) -> None:
+        if push_undo and self._boxes:
+            self._push_box_undo()
         self._boxes = list(boxes)
         self._selected_box = -1
         self._predictions = []
         self._repaint_canvas()
         self.boxes_changed.emit(list(self._boxes))
         self.selection_changed.emit(-1)
+
+    def interaction_mode(self) -> str:
+        return self._interaction_mode
+
+    def set_interaction_mode(self, mode: str) -> None:
+        self._interaction_mode = "pan" if mode == "pan" else "draw"
+        self._repaint_canvas()
+
+    def _push_box_undo(self) -> None:
+        self._box_undo.append(list(self._boxes))
+        if len(self._box_undo) > _MAX_BOX_UNDO:
+            self._box_undo = self._box_undo[-_MAX_BOX_UNDO:]
+
+    def undo_box_edit(self) -> bool:
+        """撤销最近一次字框变更（多步）。"""
+        if not self._box_undo:
+            if self._boxes:
+                self._boxes.pop()
+                self._selected_box = min(self._selected_box, len(self._boxes) - 1)
+                self._repaint_canvas()
+                self.boxes_changed.emit(list(self._boxes))
+                self.selection_changed.emit(self._selected_box)
+                return True
+            return False
+        self._boxes = self._box_undo.pop()
+        self._selected_box = min(self._selected_box, len(self._boxes) - 1) if self._boxes else -1
+        self._predictions = []
+        self._repaint_canvas()
+        self.boxes_changed.emit(list(self._boxes))
+        self.selection_changed.emit(self._selected_box)
+        return True
+
+    def merge_selected_with_neighbor(self) -> bool:
+        i = self._selected_box
+        if i < 0:
+            return False
+        self._push_box_undo()
+        merged = merge_neighbor_boxes(self._boxes, i)
+        if not merged:
+            self._box_undo.pop()
+            return False
+        self._boxes = merged
+        self._selected_box = min(i, len(self._boxes) - 1)
+        self._predictions = []
+        self._repaint_canvas()
+        self.boxes_changed.emit(list(self._boxes))
+        self.selection_changed.emit(self._selected_box)
+        return True
+
+    def merge_tiny_boxes(self) -> int:
+        before = len(self._boxes)
+        fixed = merge_tiny_boxes(self._boxes)
+        if fixed == self._boxes:
+            return 0
+        self._push_box_undo()
+        self._boxes = fixed
+        self._selected_box = -1
+        self._predictions = []
+        self._repaint_canvas()
+        self.boxes_changed.emit(list(self._boxes))
+        self.selection_changed.emit(-1)
+        return before - len(fixed)
 
     def boxes(self) -> list[tuple[int, int, int, int]]:
         return list(self._boxes)
@@ -176,15 +246,16 @@ class ImageCanvas(QLabel):
         i = self._selected_box
         if i < 0 or i >= len(self._boxes):
             return False
+        self._push_box_undo()
         x, y, w, h = self._boxes[i]
         nw = max(2, int(width)) if width is not None else w
         nh = max(2, int(height)) if height is not None else h
-        # 尽量保持中心
         cx, cy = x + w / 2, y + h / 2
         nx = int(round(cx - nw / 2))
         ny = int(round(cy - nh / 2))
         box = self._clamp_roi(nx, ny, nx + nw, ny + nh)
         if not box:
+            self._box_undo.pop()
             return False
         self._boxes[i] = box
         self._predictions = []
@@ -197,9 +268,11 @@ class ImageCanvas(QLabel):
         i = self._selected_box
         if i < 0 or i >= len(self._boxes):
             return False
+        self._push_box_undo()
         x, y, w, h = self._boxes[i]
         box = self._clamp_roi(x + dx, y + dy, x + w + dx + dw, y + h + dy + dh)
         if not box:
+            self._box_undo.pop()
             return False
         self._boxes[i] = box
         self._predictions = []
@@ -212,7 +285,6 @@ class ImageCanvas(QLabel):
         """把选中字框左右拆成两个；未选中时自动拆最宽的框。"""
         i = self._selected_box
         if i < 0 or i >= len(self._boxes):
-            # 自动挑最宽的粘连候选
             if not self._boxes:
                 return False
             i = max(range(len(self._boxes)), key=lambda k: self._boxes[k][2])
@@ -220,13 +292,13 @@ class ImageCanvas(QLabel):
         x, y, w, h = self._boxes[i]
         if w < 6:
             return False
+        self._push_box_undo()
         mid = max(2, w // 2)
         left = (x, y, mid, h)
         right = (x + mid, y, w - mid, h)
         self._boxes[i : i + 1] = [left, right]
         self._boxes.sort(key=lambda b: (b[0], b[1]))
         self._predictions = []
-        # 选中拆出的左半，方便继续拆
         try:
             self._selected_box = self._boxes.index(left)
         except ValueError:
@@ -237,11 +309,7 @@ class ImageCanvas(QLabel):
         return True
 
     def undo_box(self) -> None:
-        if self._boxes:
-            self._boxes.pop()
-            self._selected_box = min(self._selected_box, len(self._boxes) - 1)
-            self._repaint_canvas()
-            self.boxes_changed.emit(list(self._boxes))
+        self.undo_box_edit()
 
     def set_roi(self, roi: tuple[int, int, int, int] | None, *, auto_zoom: bool | None = None) -> None:
         self._roi = roi
@@ -540,7 +608,10 @@ class ImageCanvas(QLabel):
                     qp.setBrush(QColor(color.red(), color.green(), color.blue(), 40))
                     qp.drawRect(QRect(a, b).normalized())
 
-        tip = f"{self._user_zoom:.1f}x  滚轮缩放 · 长按/右键拖移 · 点绿框选中（红框=当前）"
+        tip = f"{self._user_zoom:.1f}x  "
+        if self._interaction_mode == "pan" or self._space_pan:
+            tip += "拖图模式 · "
+        tip += "滚轮缩放 · 空格/右键/长按拖移 · 点绿框选中"
         if 0 <= self._selected_box < len(self._boxes):
             bx, by, bw, bh = self._boxes[self._selected_box]
             tip += f" · 第{self._selected_box + 1}框 {bw}×{bh}"
@@ -599,6 +670,62 @@ class ImageCanvas(QLabel):
         self.setCursor(Qt.CursorShape.ClosedHandCursor)
         self._repaint_canvas()
 
+    def keyPressEvent(self, event) -> None:  # noqa: N802
+        if event.key() == Qt.Key.Key_Space and not event.isAutoRepeat():
+            self._space_pan = True
+            self.setCursor(Qt.CursorShape.OpenHandCursor)
+            event.accept()
+            return
+        if 0 <= self._selected_box < len(self._boxes):
+            step = 5 if event.modifiers() & Qt.KeyboardModifier.ControlModifier else 1
+            key = event.key()
+            if key == Qt.Key.Key_Left:
+                if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                    self.nudge_selected_box(dw=-step)
+                else:
+                    self.nudge_selected_box(dx=-step)
+                event.accept()
+                return
+            if key == Qt.Key.Key_Right:
+                if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                    self.nudge_selected_box(dw=step)
+                else:
+                    self.nudge_selected_box(dx=step)
+                event.accept()
+                return
+            if key == Qt.Key.Key_Up:
+                if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                    self.nudge_selected_box(dh=-step)
+                else:
+                    self.nudge_selected_box(dy=-step)
+                event.accept()
+                return
+            if key == Qt.Key.Key_Down:
+                if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                    self.nudge_selected_box(dh=step)
+                else:
+                    self.nudge_selected_box(dy=step)
+                event.accept()
+                return
+            if event.text() == "[":
+                self.nudge_selected_box(dw=-step)
+                event.accept()
+                return
+            if event.text() == "]":
+                self.nudge_selected_box(dw=step)
+                event.accept()
+                return
+        return super().keyPressEvent(event)
+
+    def keyReleaseEvent(self, event) -> None:  # noqa: N802
+        if event.key() == Qt.Key.Key_Space and not event.isAutoRepeat():
+            self._space_pan = False
+            if not self._panning:
+                self.unsetCursor()
+            event.accept()
+            return
+        return super().keyReleaseEvent(event)
+
     def mousePressEvent(self, event) -> None:  # noqa: N802
         if self._src is None:
             return super().mousePressEvent(event)
@@ -612,6 +739,15 @@ class ImageCanvas(QLabel):
         if event.button() != Qt.MouseButton.LeftButton:
             return super().mousePressEvent(event)
 
+        # 拖图模式 / 空格：左键直接平移
+        if self._interaction_mode == "pan" or self._space_pan:
+            self._long_press_timer.stop()
+            self._pending_blank = False
+            self._panning = True
+            self._pan_last = event.position().toPoint()
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            return
+
         img_pt = self._widget_to_image(event.position().toPoint())
         # 有绿框时：任意模式都可点选/拖改（整行蓝框模式也能选中再拆粘连）
         if self._boxes and img_pt is not None:
@@ -620,6 +756,7 @@ class ImageCanvas(QLabel):
                 self._long_press_timer.stop()
                 self._pending_blank = False
                 idx, kind = hit
+                self._push_box_undo()
                 self._selected_box = idx
                 self._edit_idx = idx
                 self._edit_kind = kind
@@ -750,6 +887,7 @@ class ImageCanvas(QLabel):
             self._repaint_canvas()
             return
         if self._mode == self.MODE_CHAR:
+            self._push_box_undo()
             self._boxes.append(box)
             self._boxes.sort(key=lambda b: (b[0], b[1]))
             self._selected_box = self._boxes.index(box) if box in self._boxes else len(self._boxes) - 1

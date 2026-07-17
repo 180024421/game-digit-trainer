@@ -37,10 +37,13 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from game_digit_trainer.balance import balance_warnings, format_balance_text
+from game_digit_trainer.balance import balance_warnings, boost_scarce_classes, format_balance_text, scarce_classes
+from game_digit_trainer.box_ops import auto_fix_boxes
 from game_digit_trainer.gold import compare_preds, tokenize_expected
 from game_digit_trainer.hard_examples import add_hard_example, list_hard_files, load_hard_index, remove_hard_file
 from game_digit_trainer.quality import export_quality_report, verify_onnx_runtime
+from game_digit_trainer.regression import add_regression_case, load_cases, run_regression
+from game_digit_trainer.studio_pack import copy_exports_to_studio
 from game_digit_trainer.templates import resolve_template, template_choices
 from game_digit_trainer.window_capture import capture_window_by_title
 
@@ -57,11 +60,12 @@ from game_digit_trainer.gui.theme import APP_QSS
 from game_digit_trainer.gui.ui_prefs import load_prefs, update_prefs
 from game_digit_trainer.gui.widgets import ImageCanvas, numpy_to_pixmap
 from game_digit_trainer.labels import display_label, normalize_label
-from game_digit_trainer.predict import check_onnx_dependency, predict_boxes_string, predict_pending_file
+from game_digit_trainer.predict import check_onnx_dependency, predict_boxes_string, predict_pending_file, score_pending_files
 from game_digit_trainer.preprocess import apply_preprocess, load_bgr
 from game_digit_trainer.project import (
     GameProject,
     RoiPreset,
+    SegmentPreset,
     create_project,
     ensure_unit_classes,
     open_project,
@@ -143,6 +147,9 @@ class MainWindow(QMainWindow):
         self._unit_btns: dict[str, QPushButton] = {}
         self._ui_prefs = load_prefs()
         self._guide_step = 0
+        self._pending_scores: dict[str, tuple[str, float]] = {}
+        self._sort_pending_by_conf = True
+        self._chk_batch_same = None  # set in _build_review
 
         root = QWidget()
         self.setCentralWidget(root)
@@ -387,6 +394,17 @@ class MainWindow(QMainWindow):
         self._syncing_box_spins = False
 
         main_tools = QHBoxLayout()
+        self.btn_mode_draw = QPushButton("画框")
+        self.btn_mode_pan = QPushButton("拖图")
+        self.btn_mode_draw.setCheckable(True)
+        self.btn_mode_pan.setCheckable(True)
+        self.btn_mode_draw.setChecked(True)
+        self.btn_mode_draw.setToolTip("左键拖出蓝/绿框（默认）")
+        self.btn_mode_pan.setToolTip("左键拖移画面；也可按住空格临时拖图")
+        self.btn_mode_draw.clicked.connect(lambda: self._set_canvas_interaction("draw"))
+        self.btn_mode_pan.clicked.connect(lambda: self._set_canvas_interaction("pan"))
+        main_tools.addWidget(self.btn_mode_draw)
+        main_tools.addWidget(self.btn_mode_pan)
         btn_auto = QPushButton("自动预览切字")
         btn_auto.clicked.connect(self._auto_preview_boxes)
         main_tools.addWidget(QLabel("间距"))
@@ -403,6 +421,12 @@ class MainWindow(QMainWindow):
         btn_split = QPushButton("拆粘连")
         btn_split.setToolTip("点选绿框后拆开；未选中时自动拆最宽的框")
         btn_split.clicked.connect(self._split_selected_box)
+        btn_merge = QPushButton("合并框")
+        btn_merge.setToolTip("把选中框与相邻框合并")
+        btn_merge.clicked.connect(self._merge_selected_box)
+        btn_fix = QPushButton("修碎框")
+        btn_fix.setToolTip("自动合并过窄碎框，并提示偏宽粘连")
+        btn_fix.clicked.connect(self._autofix_boxes)
         btn_multi = QPushButton("多ROI刷样")
         btn_multi.setToolTip("ADB截图后对所有ROI预设依次切字进待审")
         btn_multi.clicked.connect(self._multi_roi_sample)
@@ -414,6 +438,8 @@ class MainWindow(QMainWindow):
         main_tools.addWidget(btn_auto)
         main_tools.addWidget(btn_preview)
         main_tools.addWidget(btn_split)
+        main_tools.addWidget(btn_merge)
+        main_tools.addWidget(btn_fix)
         main_tools.addWidget(btn_multi)
         main_tools.addStretch()
         main_tools.addWidget(self.btn_more)
@@ -425,8 +451,16 @@ class MainWindow(QMainWindow):
         self.gold_edit.setPlaceholderText("例如 1234万 或 2:03 — 与预览对比，错字进难例/待审")
         btn_gold = QPushButton("对比回流")
         btn_gold.clicked.connect(self._gold_compare_reflow)
+        btn_gold_hard = QPushButton("错字→难例审核")
+        btn_gold_hard.setToolTip("金标对比后跳转难例队列继续标")
+        btn_gold_hard.clicked.connect(self._gold_compare_reflow)
+        btn_reg_add = QPushButton("加入回归集")
+        btn_reg_add.setToolTip("把当前图+金标存为固定回归用例")
+        btn_reg_add.clicked.connect(self._add_regression_case)
         gold_row.addWidget(self.gold_edit, 1)
         gold_row.addWidget(btn_gold)
+        gold_row.addWidget(btn_gold_hard)
+        gold_row.addWidget(btn_reg_add)
         mid_l.addLayout(gold_row)
 
         self.trial_result = QLabel("预览明细：训练后可用")
@@ -489,6 +523,35 @@ class MainWindow(QMainWindow):
         tools.addWidget(btn_clear_roi)
         tools.addStretch()
         more_l.addLayout(tools)
+
+        prep_prev = QHBoxLayout()
+        prep_prev.addWidget(QLabel("预处理预览"))
+        self.preprocess_preview = QLabel("调预处理看这里")
+        self.preprocess_preview.setFixedSize(120, 48)
+        self.preprocess_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.preprocess_preview.setStyleSheet(
+            "background:#0b1220; color:#94a3b8; border:1px solid #334155; border-radius:6px; font-size:11px;"
+        )
+        prep_prev.addWidget(self.preprocess_preview)
+        prep_prev.addStretch()
+        more_l.addLayout(prep_prev)
+
+        seg_row = QHBoxLayout()
+        seg_row.addWidget(QLabel("切字预设"))
+        self.seg_preset_combo = QComboBox()
+        self.seg_preset_combo.setMinimumWidth(120)
+        btn_seg_apply = QPushButton("套用")
+        btn_seg_save = QPushButton("保存当前")
+        btn_seg_del = QPushButton("删")
+        btn_seg_apply.clicked.connect(self._apply_segment_preset)
+        btn_seg_save.clicked.connect(self._save_segment_preset)
+        btn_seg_del.clicked.connect(self._delete_segment_preset)
+        seg_row.addWidget(self.seg_preset_combo, 1)
+        seg_row.addWidget(btn_seg_apply)
+        seg_row.addWidget(btn_seg_save)
+        seg_row.addWidget(btn_seg_del)
+        more_l.addLayout(seg_row)
+
         mid_l.addWidget(self.work_more)
         self.work_more.setVisible(False)
 
@@ -623,6 +686,21 @@ class MainWindow(QMainWindow):
         self.conf_spin.valueChanged.connect(self._persist_confirm_threshold)
         conf_row.addWidget(self.conf_spin)
         right.addLayout(conf_row)
+
+        self.chk_batch_same = QCheckBox('同类批量（同预测标签连过）')
+        self.chk_batch_same.setChecked(True)
+        self.chk_batch_same.setToolTip('批量确认时只连过与当前预测相同的标签')
+        right.addWidget(self.chk_batch_same)
+
+        self.chk_sort_conf = QCheckBox('按置信度升序（先标难的）')
+        self.chk_sort_conf.setChecked(True)
+        self.chk_sort_conf.toggled.connect(self._on_sort_conf_toggled)
+        right.addWidget(self.chk_sort_conf)
+
+        btn_prelabel = QPushButton('全部预标排序')
+        btn_prelabel.setToolTip('用当前模型给全部待审打分并按置信度排序')
+        btn_prelabel.clicked.connect(self._prelabel_all_pending)
+        right.addWidget(btn_prelabel)
 
         btn_jump_last = QPushButton('查看刚标的那张')
         btn_jump_last.setToolTip('跳到最近一次标注的样本，方便立刻改错')
@@ -761,14 +839,33 @@ class MainWindow(QMainWindow):
         btn_open_export.clicked.connect(self._open_export_dir)
         btn_copy_export = QPushButton("复制导出路径")
         btn_copy_export.clicked.connect(self._copy_export_path)
+        btn_studio = QPushButton("拷到 Studio models/")
+        btn_studio.setToolTip("选择脚本工程目录，自动写入 models/ 并生成 Lua 草稿")
+        btn_studio.clicked.connect(self._copy_to_studio)
         self.export_dep_label = QLabel("")
         self.export_dep_label.setObjectName("hintLabel")
         exp.addWidget(btn_export)
         exp.addWidget(btn_open_export)
         exp.addWidget(btn_copy_export)
+        exp.addWidget(btn_studio)
         exp.addWidget(self.export_dep_label)
         exp.addStretch()
         left.addLayout(exp)
+
+        bal_row = QHBoxLayout()
+        btn_boost = QPushButton("补齐稀缺类")
+        btn_boost.setToolTip("对样本偏少的类做增强拷贝")
+        btn_boost.clicked.connect(self._boost_scarce)
+        btn_scarce = QPushButton("查看缺哪类")
+        btn_scarce.clicked.connect(self._show_scarce_classes)
+        btn_reg_run = QPushButton("跑回归集")
+        btn_reg_run.setToolTip("对 regression/ 金标用例做推理对比")
+        btn_reg_run.clicked.connect(self._run_regression)
+        bal_row.addWidget(btn_boost)
+        bal_row.addWidget(btn_scarce)
+        bal_row.addWidget(btn_reg_run)
+        bal_row.addStretch()
+        left.addLayout(bal_row)
         layout.addLayout(left, 2)
 
         # dataset browser embedded
@@ -953,7 +1050,12 @@ class MainWindow(QMainWindow):
         self.chk_augment.blockSignals(True)
         self.chk_augment.setChecked(bool(self.project.config.augment))
         self.chk_augment.blockSignals(False)
+        if hasattr(self, "gap_spin"):
+            self.gap_spin.blockSignals(True)
+            self.gap_spin.setValue(int(getattr(self.project.config, "last_segment_gap", 3) or 3))
+            self.gap_spin.blockSignals(False)
         self._reload_roi_preset_combo()
+        self._reload_segment_presets()
 
     def _open_project_folder(self) -> None:
         proj = self._require_project()
@@ -1265,8 +1367,9 @@ class MainWindow(QMainWindow):
         self.crop_count_label.setText(f"字框 {n}")
 
     def _undo_char_box(self) -> None:
-        self.import_canvas.undo_box()
+        self.import_canvas.undo_box_edit()
         self._update_box_count()
+        self._refresh_selected_box_ui()
 
     def _clear_char_boxes(self) -> None:
         self.import_canvas.clear_boxes()
@@ -1283,6 +1386,12 @@ class MainWindow(QMainWindow):
     def _on_gap_changed(self, _value: int = 0) -> None:
         """间距一变就重跑自动切字，并刷新二值预览。"""
         self._refresh_import_preview()
+        if self.project:
+            self.project.config.last_segment_gap = int(self.gap_spin.value())
+            try:
+                self.project.save_config()
+            except Exception:
+                pass
         if self.import_canvas.roi() or self.import_canvas.boxes():
             self._auto_preview_boxes()
 
@@ -1300,11 +1409,15 @@ class MainWindow(QMainWindow):
             ox = roi[0] if roi else 0
             oy = roi[1] if roi else 0
             boxes = [(c.x + ox, c.y + oy, c.w, c.h) for c in crops]
-            self.import_canvas.set_boxes(boxes)
+            fixed, tips = auto_fix_boxes(boxes)
+            self.import_canvas.set_boxes(fixed)
             self._refresh_import_preview(keep_manual_boxes=True)
             gap = self.gap_spin.value()
+            tip = ""
+            if tips:
+                tip = f"；建议拆粘连：第 {', '.join(str(i + 1) for i in tips[:5])} 框偏宽"
             self._status.showMessage(
-                f"自动预览 {len(boxes)} 个字框（间距={gap}）— 切碎调大间距，粘连调小；点绿框后可「拆粘连」"
+                f"自动预览 {len(fixed)} 个字框（间距={gap}，已修碎框）{tip}"
             )
         except Exception as exc:
             QMessageBox.warning(self, "自动切字失败", str(exc))
@@ -1331,13 +1444,30 @@ class MainWindow(QMainWindow):
                     show = apply_preprocess(bgr, self.project.config.preprocess)
             else:
                 show = bgr
-            # 只刷新底图，保留已有绿字框
             self.import_canvas.set_image_bgr_or_gray(
                 show, boxes=None, draw_stored_roi=True, keep_boxes=True
             )
             self._update_box_count()
+            self._update_preprocess_mini_preview(bgr, roi)
         except Exception as exc:
             self.import_canvas.setText(str(exc))
+
+    def _update_preprocess_mini_preview(self, bgr, roi) -> None:
+        if not hasattr(self, "preprocess_preview") or not self.project:
+            return
+        try:
+            sliced = crop_bgr(bgr, roi)
+            binary = apply_preprocess(sliced, self.project.config.preprocess)
+            pix = numpy_to_pixmap(binary).scaled(
+                116,
+                44,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.FastTransformation,
+            )
+            self.preprocess_preview.setPixmap(pix)
+            self.preprocess_preview.setText("")
+        except Exception:
+            self.preprocess_preview.setText("预览失败")
 
     def _segment_current(self) -> None:
         proj = self._require_project()
@@ -1414,6 +1544,10 @@ class MainWindow(QMainWindow):
         if not self.project:
             return
         self._pending = self.project.pending_files()
+        if self._sort_pending_by_conf and self._pending_scores:
+            self._pending.sort(
+                key=lambda p: self._pending_scores.get(p.name, ("", 1.0))[1]
+            )
         self._labeled = list_all_labeled(self.project)
         self._hard = list_hard_files(self.project)
         self._rebuild_gallery()
@@ -1439,7 +1573,11 @@ class MainWindow(QMainWindow):
             items = [(p, lab) for p, lab in self._labeled]
         for i, (path, lab) in enumerate(items):
             if lab is None:
-                title = f"{i + 1}"
+                score = self._pending_scores.get(path.name)
+                if score:
+                    title = f"{display_label(score[0])} {score[1]:.0%}"
+                else:
+                    title = f"{i + 1}"
             elif str(lab).startswith("难:"):
                 title = str(lab)[2:6]
             else:
@@ -1447,6 +1585,8 @@ class MainWindow(QMainWindow):
             item = QListWidgetItem(title)
             item.setData(Qt.ItemDataRole.UserRole, str(path))
             tip = path.name if lab is None else f"{lab} · {path.name}"
+            if lab is None and path.name in self._pending_scores:
+                tip += f" · pred {self._pending_scores[path.name]}"
             item.setToolTip(tip)
             raw = np.fromfile(str(path), dtype=np.uint8)
             img = cv2.imdecode(raw, cv2.IMREAD_GRAYSCALE)
@@ -1661,9 +1801,11 @@ class MainWindow(QMainWindow):
             return
         if hasattr(self, "batch_stop_label"):
             self.batch_stop_label.setVisible(False)
+        seed_label = normalize_label(self._pred_label)
         self._assign(self._pred_label)
         if not self.chk_batch_confirm.isChecked():
             return
+        same_only = bool(getattr(self, "chk_batch_same", None) and self.chk_batch_same.isChecked())
         self._batch_confirming = True
         stopped_reason = ""
         try:
@@ -1675,6 +1817,12 @@ class MainWindow(QMainWindow):
                     stopped_reason = (
                         f"批量确认已停下：预测「{display_label(self._pred_label)}」"
                         f"置信度 {self._pred_conf:.0%} < 阈值 {float(self.conf_spin.value()):.0%}，请手标"
+                    )
+                    break
+                if same_only and normalize_label(self._pred_label) != seed_label:
+                    stopped_reason = (
+                        f"同类批量已停下：下一张预测是「{display_label(self._pred_label)}」"
+                        f"（当前批为「{display_label(seed_label)}」）"
                     )
                     break
                 self._assign(self._pred_label)
@@ -2299,6 +2447,213 @@ class MainWindow(QMainWindow):
         self.trial_result.setText(f"预览明细：{detail}")
         if not silent:
             self._status.showMessage(f"识别预览：{text}")
+
+    def _set_canvas_interaction(self, mode: str) -> None:
+        self.import_canvas.set_interaction_mode(mode)
+        if hasattr(self, "btn_mode_draw"):
+            self.btn_mode_draw.setChecked(mode == "draw")
+            self.btn_mode_pan.setChecked(mode == "pan")
+        self._status.showMessage("拖图模式：左键拖画面" if mode == "pan" else "画框模式：左键拖出字框")
+
+    def _merge_selected_box(self) -> None:
+        if not self.import_canvas.boxes():
+            QMessageBox.information(self, "提示", "还没有绿框")
+            return
+        if self.import_canvas.selected_box_index() < 0:
+            QMessageBox.information(self, "提示", "请先点选一个绿框再合并")
+            return
+        if not self.import_canvas.merge_selected_with_neighbor():
+            QMessageBox.information(self, "提示", "无法合并（至少需要两个框）")
+            return
+        self._status.showMessage("已合并相邻字框")
+        self._preview_timer.start(300)
+
+    def _autofix_boxes(self) -> None:
+        boxes = self.import_canvas.boxes()
+        if not boxes:
+            QMessageBox.information(self, "提示", "还没有绿框")
+            return
+        fixed, tips = auto_fix_boxes(boxes)
+        self.import_canvas.set_boxes(fixed)
+        msg = f"已修碎框 → {len(fixed)} 个"
+        if tips:
+            msg += f"；建议拆：第 {', '.join(str(i + 1) for i in tips[:6])} 框"
+            # 自动选中最宽建议框
+            self.import_canvas.select_box(tips[0])
+        self._status.showMessage(msg)
+
+    def _reload_segment_presets(self) -> None:
+        if not hasattr(self, "seg_preset_combo") or not self.project:
+            return
+        self.seg_preset_combo.clear()
+        for p in self.project.config.segment_presets:
+            self.seg_preset_combo.addItem(f"{p.name} (gap={p.gap})", p.name)
+
+    def _apply_segment_preset(self) -> None:
+        if not self.project or not hasattr(self, "seg_preset_combo"):
+            return
+        name = self.seg_preset_combo.currentData()
+        preset = next((p for p in self.project.config.segment_presets if p.name == name), None)
+        if not preset:
+            return
+        self.gap_spin.setValue(int(preset.gap))
+        self.chk_invert.setChecked(bool(preset.invert))
+        idx = self.binarize_combo.findText(str(preset.binarize))
+        if idx >= 0:
+            self.binarize_combo.setCurrentIndex(idx)
+        self._auto_preview_boxes()
+        self._status.showMessage(f"已套用切字预设「{preset.name}」")
+
+    def _save_segment_preset(self) -> None:
+        if not self.project:
+            return
+        name, ok = QInputDialog.getText(self, "切字预设", "名称：", text="默认切字")
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+        preset = SegmentPreset(
+            name=name,
+            gap=int(self.gap_spin.value()),
+            invert=bool(self.chk_invert.isChecked()),
+            binarize=str(self.binarize_combo.currentText()),
+        )
+        cfg = self.project.config
+        cfg.segment_presets = [p for p in cfg.segment_presets if p.name != name] + [preset]
+        self.project.save_config()
+        self._reload_segment_presets()
+        self._status.showMessage(f"已保存切字预设「{name}」")
+
+    def _delete_segment_preset(self) -> None:
+        if not self.project or not hasattr(self, "seg_preset_combo"):
+            return
+        name = self.seg_preset_combo.currentData()
+        if not name:
+            return
+        cfg = self.project.config
+        cfg.segment_presets = [p for p in cfg.segment_presets if p.name != name]
+        self.project.save_config()
+        self._reload_segment_presets()
+
+    def _on_sort_conf_toggled(self, checked: bool) -> None:
+        self._sort_pending_by_conf = bool(checked)
+        self._reload_review_lists()
+
+    def _prelabel_all_pending(self) -> None:
+        proj = self._require_project()
+        if not proj:
+            return
+        ckpt = latest_checkpoint(proj)
+        if not ckpt:
+            QMessageBox.information(self, "提示", "请先训练出模型再预标")
+            return
+        paths = proj.pending_files()
+        if not paths:
+            QMessageBox.information(self, "提示", "没有待审样本")
+            return
+        scored = score_pending_files(
+            ckpt,
+            paths,
+            proj.config.classes,
+            proj.config.input_width,
+            proj.config.input_height,
+        )
+        self._pending_scores = {p.name: (lab, conf) for p, lab, conf in scored}
+        self._sort_pending_by_conf = True
+        if hasattr(self, "chk_sort_conf"):
+            self.chk_sort_conf.setChecked(True)
+        self._set_review_mode("pending")
+        self._reload_review_lists()
+        self._status.showMessage(f"已预标 {len(scored)} 张，按置信度升序（难的在前）")
+
+    def _copy_to_studio(self) -> None:
+        proj = self._require_project()
+        if not proj:
+            return
+        path = QFileDialog.getExistingDirectory(self, "选择脚本工程目录（将写入 models/）")
+        if not path:
+            return
+        models = Path(path) / "models"
+        try:
+            copied = copy_exports_to_studio(proj.exports_dir, models)
+        except Exception as exc:
+            QMessageBox.warning(self, "拷贝失败", str(exc))
+            return
+        QMessageBox.information(
+            self,
+            "已拷到 Studio",
+            f"目标：{models}\n文件：{', '.join(copied)}\n详见 docs/studio-recognize-digits.md",
+        )
+
+    def _boost_scarce(self) -> None:
+        proj = self._require_project()
+        if not proj:
+            return
+        counts = proj.class_counts()
+        added = boost_scarce_classes(proj.dataset_dir, proj.config.classes, counts, target=12)
+        if not added:
+            QMessageBox.information(self, "均衡", "没有需要补齐的稀缺类（或全是 0 样本）")
+            return
+        detail = "、".join(f"{k}+{v}" for k, v in added.items())
+        self._refresh_project_info()
+        self._reload_dataset_browser()
+        QMessageBox.information(self, "已补齐", f"增强拷贝：{detail}")
+
+    def _show_scarce_classes(self) -> None:
+        proj = self._require_project()
+        if not proj:
+            return
+        counts = proj.class_counts()
+        scarce = scarce_classes(counts)
+        text = format_balance_text(counts)
+        if scarce:
+            text += "\n\n优先刷这些类：\n" + "\n".join(f"· {k}: {v}" for k, v in scarce)
+        QMessageBox.information(self, "类别均衡", text)
+
+    def _add_regression_case(self) -> None:
+        proj = self._require_project()
+        if not proj:
+            return
+        if not self._current_import:
+            QMessageBox.information(self, "提示", "请先打开一张截图")
+            return
+        expected = self.gold_edit.text().strip()
+        if not expected:
+            QMessageBox.information(self, "提示", "请先填写金标")
+            return
+        try:
+            item = add_regression_case(
+                proj,
+                image_path=self._current_import,
+                expected=expected,
+                boxes=self.import_canvas.boxes() or None,
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "失败", str(exc))
+            return
+        self._status.showMessage(f"已加入回归集：{item.get('name')}（共 {len(load_cases(proj))} 条）")
+
+    def _run_regression(self) -> None:
+        proj = self._require_project()
+        if not proj:
+            return
+        ckpt = latest_checkpoint(proj)
+        if not ckpt:
+            QMessageBox.information(self, "提示", "请先训练")
+            return
+        cases = load_cases(proj)
+        if not cases:
+            QMessageBox.information(self, "提示", "回归集为空：在切字页填金标后点「加入回归集」")
+            return
+        report = run_regression(proj, ckpt)
+        lines = [f"通过 {report['passed']}/{report['total']}"]
+        for r in report.get("results") or []:
+            if r.get("ok"):
+                lines.append(f"✓ {r.get('name')}: {r.get('got')}")
+            else:
+                lines.append(
+                    f"✗ {r.get('name')}: expect={r.get('expected')} got={r.get('got') or r.get('error')}"
+                )
+        QMessageBox.information(self, "回归结果", "\n".join(lines[:40]))
 
     def _split_selected_box(self) -> None:
         before = self.import_canvas.selected_box_index()

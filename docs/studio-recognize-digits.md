@@ -3,6 +3,21 @@
 > 供 [auto-script-studio](https://github.com/180024421/auto-script-studio) 二期接入参考。  
 > 本仓库 v1 **不修改** Studio 运行时；导出包拷到工程 `models/` 即可。
 
+## 一键拷贝
+
+训练站「③ 训练导出」→ **拷到 Studio models/**：选择脚本工程根目录，会写入：
+
+```text
+your-script/models/
+  digits.onnx
+  digits.labels
+  manifest.json
+  README.txt
+  recognize_digits.lua   # 接入草稿
+```
+
+也可手动把 `projects/<game>/exports/` 整目录拷过去。
+
 ## 导出包
 
 ```text
@@ -13,14 +28,6 @@ exports/
   README.txt
 ```
 
-把整个 `exports/`（或其中三个文件）拷到脚本工程例如：
-
-```text
-your-script/models/digits.onnx
-your-script/models/digits.labels
-your-script/models/manifest.json
-```
-
 ## 约定
 
 - 输入：`NCHW` float32，单通道，像素 `/255` → `[0,1]`
@@ -29,37 +36,26 @@ your-script/models/manifest.json
 
 预处理应与训练站一致（灰度 / 反色 / 二值化），见 `manifest.preprocess`。
 
-## Lua 伪代码（草稿）
+## 回归自检
+
+1. 切字页填金标 → **加入回归集**（存到 `projects/<game>/regression/`）
+2. 导出/训练后点 **跑回归集**，对照期望字符串
+
+## Lua
+
+见拷贝后的 `models/recognize_digits.lua`。核心：
 
 ```lua
--- 假设运行时提供：cropRoi / preprocessGray / onnxInfer / loadLabels
--- 实际 API 名以 Studio 二期为准
-
-local function recognizeDigits(roi)
-  local labels = loadLabels("models/digits.labels")
-  local boxes = segmentChars(roi)  -- 或脚本侧已切好的字框列表
-  local parts = {}
-  for i, box in ipairs(boxes) do
-    local gray = preprocessGray(cropRoi(roi, box), manifest.preprocess)
-    local tensor = resizeNorm(gray, manifest.input.width, manifest.input.height)
-    local logits = onnxInfer("models/digits.onnx", tensor)
-    local idx, conf = argmaxSoftmax(logits)
-    parts[#parts+1] = { label = labels[idx], conf = conf }
-  end
-  return joinDisplay(parts), parts
-end
-
--- 例：读金币行
-local text, parts = recognizeDigits(coinRoi)
+local text, parts = recognizeDigits(coinRoi, "models")
 log("金币=" .. text)
 ```
 
+（`segmentChars` / `onnxInfer` 等 API 以 Studio 二期为准。）
+
 ## 热更新
 
-若 Studio 支持运行时按路径加载 ONNX：只需替换 `models/digits.onnx`（及 labels/manifest），**无需重打包 APK**。  
-若不支持，则需把模型打进资源包后重装。
+若 Studio 支持运行时按路径加载 ONNX：只需替换 `models/digits.onnx`（及 labels/manifest），**无需重打包 APK**。
 
-## 自检
+## 切字说明
 
-训练站导出后会尝试 `onnxruntime` 跑一次 dummy（可选安装）。  
-脚本侧建议在接入时对已知截图做一次对比测试。
+训练站侧以投影切字 + **修碎框 / 拆粘连 / 合并框** 为主；未引入 YOLO（保持包体小）。粘连严重时优先调间距/切字预设与人工拆合。

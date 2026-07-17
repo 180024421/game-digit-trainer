@@ -27,6 +27,14 @@ class RoiPreset:
 
 
 @dataclass
+class SegmentPreset:
+    name: str
+    gap: int = 3
+    invert: bool = False
+    binarize: str = "otsu"
+
+
+@dataclass
 class ProjectConfig:
     game_id: str
     classes: list[str] = field(default_factory=lambda: list(DIGIT_CLASSES))
@@ -36,8 +44,10 @@ class ProjectConfig:
     preprocess: PreprocessConfig = field(default_factory=PreprocessConfig)
     created_at: str = ""
     roi_presets: list[RoiPreset] = field(default_factory=list)
+    segment_presets: list[SegmentPreset] = field(default_factory=list)
     confirm_threshold: float = 0.85
     augment: bool = True
+    last_segment_gap: int = 3
 
     def validate(self) -> ProjectConfig:
         if not self.game_id.strip():
@@ -191,6 +201,21 @@ def load_config(path: Path) -> ProjectConfig:
             )
         except (KeyError, TypeError, ValueError):
             continue
+    seg_presets: list[SegmentPreset] = []
+    for item in data.get("segment_presets") or []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            seg_presets.append(
+                SegmentPreset(
+                    name=str(item.get("name") or "未命名"),
+                    gap=int(item.get("gap", 3)),
+                    invert=bool(item.get("invert", False)),
+                    binarize=str(item.get("binarize", "otsu")),
+                )
+            )
+        except (TypeError, ValueError):
+            continue
     return ProjectConfig(
         game_id=str(data["game_id"]),
         classes=list(data.get("classes") or DIGIT_CLASSES),
@@ -200,8 +225,10 @@ def load_config(path: Path) -> ProjectConfig:
         preprocess=prep,
         created_at=str(data.get("created_at") or ""),
         roi_presets=presets,
+        segment_presets=seg_presets,
         confirm_threshold=float(data.get("confirm_threshold", 0.85)),
         augment=bool(data.get("augment", True)),
+        last_segment_gap=int(data.get("last_segment_gap", 3)),
     ).validate()
 
 
@@ -215,8 +242,10 @@ def save_config(path: Path, cfg: ProjectConfig) -> None:
         "preprocess": asdict(cfg.preprocess),
         "created_at": cfg.created_at,
         "roi_presets": [asdict(p) for p in cfg.roi_presets],
+        "segment_presets": [asdict(p) for p in cfg.segment_presets],
         "confirm_threshold": cfg.confirm_threshold,
         "augment": cfg.augment,
+        "last_segment_gap": cfg.last_segment_gap,
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
