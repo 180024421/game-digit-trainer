@@ -78,8 +78,9 @@ class ImageCanvas(QLabel):
         self._interaction_mode = "draw"  # draw | pan
         self._space_pan = False
         self._box_undo: list[list[tuple[int, int, int, int]]] = []
+        self._box_redo: list[list[tuple[int, int, int, int]]] = []
         self._hint_roi = "区域模式：拖蓝框；空格/「拖图」平移；方向键微调选中框"
-        self._hint_char = "手动切字：拖绿框；空格拖图；[ ] 调宽；方向键微调"
+        self._hint_char = "手动切字：拖绿框；空格拖图；[ ] 调宽；Ctrl+Y 重做"
         self.setText(self._hint_roi)
 
     def sizeHint(self) -> QSize:  # noqa: N802
@@ -155,6 +156,7 @@ class ImageCanvas(QLabel):
 
     def _push_box_undo(self) -> None:
         self._box_undo.append(list(self._boxes))
+        self._box_redo.clear()
         if len(self._box_undo) > _MAX_BOX_UNDO:
             self._box_undo = self._box_undo[-_MAX_BOX_UNDO:]
 
@@ -162,6 +164,7 @@ class ImageCanvas(QLabel):
         """撤销最近一次字框变更（多步）。"""
         if not self._box_undo:
             if self._boxes:
+                self._box_redo.append(list(self._boxes))
                 self._boxes.pop()
                 self._selected_box = min(self._selected_box, len(self._boxes) - 1)
                 self._repaint_canvas()
@@ -169,7 +172,20 @@ class ImageCanvas(QLabel):
                 self.selection_changed.emit(self._selected_box)
                 return True
             return False
+        self._box_redo.append(list(self._boxes))
         self._boxes = self._box_undo.pop()
+        self._selected_box = min(self._selected_box, len(self._boxes) - 1) if self._boxes else -1
+        self._predictions = []
+        self._repaint_canvas()
+        self.boxes_changed.emit(list(self._boxes))
+        self.selection_changed.emit(self._selected_box)
+        return True
+
+    def redo_box_edit(self) -> bool:
+        if not self._box_redo:
+            return False
+        self._box_undo.append(list(self._boxes))
+        self._boxes = self._box_redo.pop()
         self._selected_box = min(self._selected_box, len(self._boxes) - 1) if self._boxes else -1
         self._predictions = []
         self._repaint_canvas()

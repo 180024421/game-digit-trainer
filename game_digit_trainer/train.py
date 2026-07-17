@@ -199,5 +199,22 @@ def train_project(
         json.dumps({"history": history, "best_val_acc": best_acc}, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+    try:
+        from game_digit_trainer.confusion import compute_confusion
+
+        if best_path.is_file():
+            conf_report = compute_confusion(project, best_path)
+            (run_dir / "confusion.json").write_text(
+                json.dumps(conf_report, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            pairs = conf_report.get("pairs") or []
+            if pairs:
+                tip = "、".join(
+                    f"{p['true_display']}→{p['pred_display']}×{p['count']}" for p in pairs[:5]
+                )
+                _log(f"易错对: {tip}")
+    except Exception as exc:
+        _log(f"混淆矩阵跳过: {exc}")
     _log(f"最佳模型: {best_path}  val_acc={best_acc:.3f}")
     return best_path

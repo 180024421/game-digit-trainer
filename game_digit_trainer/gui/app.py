@@ -37,8 +37,10 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from game_digit_trainer.backup import backup_project
 from game_digit_trainer.balance import balance_warnings, boost_scarce_classes, format_balance_text, scarce_classes
 from game_digit_trainer.box_ops import auto_fix_boxes
+from game_digit_trainer.confusion import compute_confusion, format_confusion_text
 from game_digit_trainer.gold import compare_preds, tokenize_expected
 from game_digit_trainer.hard_examples import add_hard_example, list_hard_files, load_hard_index, remove_hard_file
 from game_digit_trainer.quality import export_quality_report, verify_onnx_runtime
@@ -421,15 +423,6 @@ class MainWindow(QMainWindow):
         btn_split = QPushButton("拆粘连")
         btn_split.setToolTip("点选绿框后拆开；未选中时自动拆最宽的框")
         btn_split.clicked.connect(self._split_selected_box)
-        btn_merge = QPushButton("合并框")
-        btn_merge.setToolTip("把选中框与相邻框合并")
-        btn_merge.clicked.connect(self._merge_selected_box)
-        btn_fix = QPushButton("修碎框")
-        btn_fix.setToolTip("自动合并过窄碎框，并提示偏宽粘连")
-        btn_fix.clicked.connect(self._autofix_boxes)
-        btn_multi = QPushButton("多ROI刷样")
-        btn_multi.setToolTip("ADB截图后对所有ROI预设依次切字进待审")
-        btn_multi.clicked.connect(self._multi_roi_sample)
         self.btn_more = QToolButton()
         self.btn_more.setText("更多 ▾")
         self.btn_more.setCheckable(True)
@@ -438,9 +431,6 @@ class MainWindow(QMainWindow):
         main_tools.addWidget(btn_auto)
         main_tools.addWidget(btn_preview)
         main_tools.addWidget(btn_split)
-        main_tools.addWidget(btn_merge)
-        main_tools.addWidget(btn_fix)
-        main_tools.addWidget(btn_multi)
         main_tools.addStretch()
         main_tools.addWidget(self.btn_more)
         mid_l.addLayout(main_tools)
@@ -451,15 +441,11 @@ class MainWindow(QMainWindow):
         self.gold_edit.setPlaceholderText("例如 1234万 或 2:03 — 与预览对比，错字进难例/待审")
         btn_gold = QPushButton("对比回流")
         btn_gold.clicked.connect(self._gold_compare_reflow)
-        btn_gold_hard = QPushButton("错字→难例审核")
-        btn_gold_hard.setToolTip("金标对比后跳转难例队列继续标")
-        btn_gold_hard.clicked.connect(self._gold_compare_reflow)
         btn_reg_add = QPushButton("加入回归集")
         btn_reg_add.setToolTip("把当前图+金标存为固定回归用例")
         btn_reg_add.clicked.connect(self._add_regression_case)
         gold_row.addWidget(self.gold_edit, 1)
         gold_row.addWidget(btn_gold)
-        gold_row.addWidget(btn_gold_hard)
         gold_row.addWidget(btn_reg_add)
         mid_l.addLayout(gold_row)
 
@@ -552,8 +538,63 @@ class MainWindow(QMainWindow):
         seg_row.addWidget(btn_seg_del)
         more_l.addLayout(seg_row)
 
+        extra_tools = QHBoxLayout()
+        btn_merge = QPushButton("合并框")
+        btn_merge.clicked.connect(self._merge_selected_box)
+        btn_fix = QPushButton("修碎框")
+        btn_fix.clicked.connect(self._autofix_boxes)
+        btn_multi = QPushButton("多ROI刷样")
+        btn_multi.clicked.connect(self._multi_roi_sample)
+        extra_tools.addWidget(btn_merge)
+        extra_tools.addWidget(btn_fix)
+        extra_tools.addWidget(btn_multi)
+        extra_tools.addStretch()
+        more_l.addLayout(extra_tools)
+
+        auto_row = QHBoxLayout()
+        self.chk_auto_roi = QCheckBox("定时刷样")
+        self.chk_auto_roi.setToolTip("按间隔对当前蓝框/ROI 预设自动截图切字")
+        self.auto_roi_spin = QSpinBox()
+        self.auto_roi_spin.setRange(3, 120)
+        self.auto_roi_spin.setValue(8)
+        self.auto_roi_spin.setSuffix(" 秒")
+        self.chk_auto_roi.toggled.connect(self._toggle_auto_roi_sample)
+        auto_row.addWidget(self.chk_auto_roi)
+        auto_row.addWidget(self.auto_roi_spin)
+        auto_row.addStretch()
+        more_l.addLayout(auto_row)
+
+        color_row = QHBoxLayout()
+        self.chk_color_filter = QCheckBox("颜色过滤(HSV)")
+        self.chk_color_filter.setToolTip("只保留指定色相范围的像素再切字")
+        self.color_h_min = QSpinBox()
+        self.color_h_min.setRange(0, 180)
+        self.color_h_min.setValue(0)
+        self.color_h_max = QSpinBox()
+        self.color_h_max.setRange(0, 180)
+        self.color_h_max.setValue(180)
+        self.color_s_min = QSpinBox()
+        self.color_s_min.setRange(0, 255)
+        self.color_s_min.setValue(40)
+        for w in (self.chk_color_filter, self.color_h_min, self.color_h_max, self.color_s_min):
+            if w is self.chk_color_filter:
+                w.stateChanged.connect(lambda _: self._on_color_filter_changed())
+            else:
+                w.valueChanged.connect(lambda _=0: self._on_color_filter_changed())
+        color_row.addWidget(self.chk_color_filter)
+        color_row.addWidget(QLabel("H"))
+        color_row.addWidget(self.color_h_min)
+        color_row.addWidget(QLabel("-"))
+        color_row.addWidget(self.color_h_max)
+        color_row.addWidget(QLabel("S≥"))
+        color_row.addWidget(self.color_s_min)
+        color_row.addStretch()
+        more_l.addLayout(color_row)
+
         mid_l.addWidget(self.work_more)
         self.work_more.setVisible(False)
+        self._auto_roi_timer = QTimer(self)
+        self._auto_roi_timer.timeout.connect(self._auto_roi_tick)
 
         splitter.addWidget(mid)
 
@@ -782,6 +823,9 @@ class MainWindow(QMainWindow):
         sc = QShortcut(QKeySequence('Ctrl+Z'), self)
         sc.setContext(Qt.ShortcutContext.WindowShortcut)
         sc.activated.connect(self._undo_contextual)
+        sc_redo = QShortcut(QKeySequence('Ctrl+Y'), self)
+        sc_redo.setContext(Qt.ShortcutContext.WindowShortcut)
+        sc_redo.activated.connect(self._redo_contextual)
         sc_enter = QShortcut(QKeySequence(Qt.Key.Key_Return), self)
         sc_enter.setContext(Qt.ShortcutContext.WindowShortcut)
         sc_enter.activated.connect(self._enter_contextual)
@@ -864,6 +908,15 @@ class MainWindow(QMainWindow):
         bal_row.addWidget(btn_boost)
         bal_row.addWidget(btn_scarce)
         bal_row.addWidget(btn_reg_run)
+        btn_conf = QPushButton("混淆矩阵")
+        btn_conf.clicked.connect(self._show_confusion)
+        btn_backup = QPushButton("备份项目")
+        btn_backup.clicked.connect(self._backup_project)
+        btn_cmp = QPushButton("多项目对比")
+        btn_cmp.clicked.connect(self._compare_projects)
+        bal_row.addWidget(btn_conf)
+        bal_row.addWidget(btn_backup)
+        bal_row.addWidget(btn_cmp)
         bal_row.addStretch()
         left.addLayout(bal_row)
         layout.addLayout(left, 2)
@@ -926,6 +979,19 @@ class MainWindow(QMainWindow):
         cfg = self.project.config.preprocess
         cfg.invert = self.chk_invert.isChecked()
         cfg.binarize = self.binarize_combo.currentText()
+        if hasattr(self, "chk_color_filter") and self.chk_color_filter.isChecked():
+            cfg.color_filter = {
+                "lower": [int(self.color_h_min.value()), int(self.color_s_min.value()), 0],
+                "upper": [int(self.color_h_max.value()), 255, 255],
+            }
+        else:
+            cfg.color_filter = None
+
+    def _on_color_filter_changed(self) -> None:
+        self._apply_preprocess_ui()
+        self._refresh_import_preview()
+        if self.import_canvas.roi() or self.import_canvas.boxes():
+            self._auto_preview_boxes()
 
     def _persist_preprocess(self) -> None:
         if not self.project:
@@ -2655,6 +2721,92 @@ class MainWindow(QMainWindow):
                 )
         QMessageBox.information(self, "回归结果", "\n".join(lines[:40]))
 
+    def _toggle_auto_roi_sample(self, checked: bool) -> None:
+        if checked:
+            ms = max(3000, int(self.auto_roi_spin.value()) * 1000)
+            self._auto_roi_timer.start(ms)
+            self._status.showMessage(f"定时刷样已开：每 {self.auto_roi_spin.value()} 秒")
+        else:
+            self._auto_roi_timer.stop()
+            self._status.showMessage("定时刷样已关")
+
+    def _auto_roi_tick(self) -> None:
+        if not self.project:
+            self.chk_auto_roi.setChecked(False)
+            return
+        try:
+            if self.project.config.roi_presets:
+                self._multi_roi_sample()
+            else:
+                dest = self._capture_dest_dir()
+                if not dest:
+                    return
+                path = capture_adb(dest)
+                self._add_captured_path(path, apply_last_roi=bool(self._last_roi))
+                if self.import_canvas.roi() or self._last_roi:
+                    if self._last_roi and not self.import_canvas.roi():
+                        self.import_canvas.set_roi(self._last_roi)
+                    self._auto_preview_boxes()
+                    self._segment_current()
+            self._status.showMessage("定时刷样：已采集一轮")
+        except Exception as exc:
+            self._status.showMessage(f"定时刷样失败: {exc}")
+
+    def _show_confusion(self) -> None:
+        proj = self._require_project()
+        if not proj:
+            return
+        ckpt = latest_checkpoint(proj)
+        if not ckpt:
+            QMessageBox.information(self, "提示", "请先训练")
+            return
+        try:
+            report = compute_confusion(proj, ckpt)
+        except Exception as exc:
+            QMessageBox.warning(self, "失败", str(exc))
+            return
+        QMessageBox.information(self, "混淆矩阵 / 易错对", format_confusion_text(report))
+
+    def _backup_project(self) -> None:
+        proj = self._require_project()
+        if not proj:
+            return
+        try:
+            path = backup_project(proj)
+        except Exception as exc:
+            QMessageBox.warning(self, "备份失败", str(exc))
+            return
+        QMessageBox.information(self, "已备份", str(path))
+        self._status.showMessage(f"已备份: {path}")
+
+    def _compare_projects(self) -> None:
+        root = projects_root()
+        if not root.is_dir():
+            QMessageBox.information(self, "提示", f"尚无项目目录: {root}")
+            return
+        lines = ["多项目对比（样本数 / 最近 val_acc）：", ""]
+        for p in sorted(root.iterdir()):
+            if not (p / "config.json").is_file():
+                continue
+            try:
+                proj = open_project(p)
+                counts = proj.class_counts()
+                total = sum(counts.values())
+                scarce = scarce_classes(counts)
+                runs = sorted(proj.runs_dir.glob("*/metrics.json"), key=lambda x: x.stat().st_mtime, reverse=True)
+                acc = "—"
+                if runs:
+                    import json
+
+                    data = json.loads(runs[0].read_text(encoding="utf-8"))
+                    if data.get("best_val_acc") is not None:
+                        acc = f"{float(data['best_val_acc']):.0%}"
+                tip = f"缺{len(scarce)}类" if scarce else "均衡尚可"
+                lines.append(f"· {proj.config.game_id}: 样本 {total} · val {acc} · {tip}")
+            except Exception as exc:
+                lines.append(f"· {p.name}: 读取失败 ({exc})")
+        QMessageBox.information(self, "多项目对比", "\n".join(lines[:40]))
+
     def _split_selected_box(self) -> None:
         before = self.import_canvas.selected_box_index()
         if not self.import_canvas.boxes():
@@ -2893,6 +3045,14 @@ class MainWindow(QMainWindow):
             self._undo_char_box()
         elif idx == self.TAB_REVIEW:
             self._undo_last_label()
+
+    def _redo_contextual(self) -> None:
+        if self.tabs.currentIndex() != self.TAB_WORK:
+            return
+        if self.import_canvas.redo_box_edit():
+            self._update_box_count()
+            self._refresh_selected_box_ui()
+            self._status.showMessage("已重做字框变更")
 
     def _enter_contextual(self) -> None:
         if self.tabs.currentIndex() == self.TAB_WORK:
