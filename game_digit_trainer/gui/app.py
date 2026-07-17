@@ -244,8 +244,28 @@ class MainWindow(QMainWindow):
         self.import_canvas.setMinimumHeight(420)
         self.import_canvas.roi_changed.connect(self._on_roi_changed)
         self.import_canvas.boxes_changed.connect(self._on_boxes_changed)
+        self.import_canvas.view_changed.connect(self._on_view_changed)
         mid_l.addWidget(self.import_canvas, 1)
 
+        zoom_row = QHBoxLayout()
+        self.zoom_label = QLabel("缩放 1.0x")
+        self.zoom_label.setObjectName("hintLabel")
+        btn_zoom_roi = QPushButton("放大到蓝框")
+        btn_zoom_roi.setToolTip("把蓝框区域放大到视野中央，方便框小字")
+        btn_zoom_fit = QPushButton("适应窗口")
+        btn_zoom_in = QPushButton("放大 +")
+        btn_zoom_out = QPushButton("缩小 -")
+        btn_zoom_roi.clicked.connect(self._zoom_to_roi)
+        btn_zoom_fit.clicked.connect(self.import_canvas.reset_view)
+        btn_zoom_in.clicked.connect(lambda: self._nudge_zoom(1.25))
+        btn_zoom_out.clicked.connect(lambda: self._nudge_zoom(0.8))
+        zoom_row.addWidget(self.zoom_label)
+        zoom_row.addWidget(btn_zoom_roi)
+        zoom_row.addWidget(btn_zoom_in)
+        zoom_row.addWidget(btn_zoom_out)
+        zoom_row.addWidget(btn_zoom_fit)
+        zoom_row.addStretch()
+        mid_l.addLayout(zoom_row)
         tools = QHBoxLayout()
         self.chk_show_binary = QCheckBox("看二值图")
         self.chk_show_binary.setChecked(False)
@@ -771,29 +791,53 @@ class MainWindow(QMainWindow):
         self.import_canvas.set_mode(mode)
         if mode == "char":
             self.work_hint.setText(
-                "手动切字：每个字拖一个绿框（例如 2、:、0、3 共 4 个框）→ 点「确认切字 → 审核」"
+                "手动切字：滚轮放大 → 每个字拖一个绿框 →「确认切字」。右键拖动画布。"
             )
             self.btn_mode_char.setObjectName("primaryBtn")
             self.btn_mode_roi.setObjectName("")
+            # 若已有蓝框，自动放大方便框字
+            if self.import_canvas.roi():
+                self.import_canvas.zoom_to_rect(self.import_canvas.roi(), margin=0.35)
         else:
             self.work_hint.setText(
-                "区域模式：先拖蓝框框住整行数字 → 点「自动预览切字」看绿框 → 再确认切字"
+                "区域模式：拖蓝框框住数字行会自动放大 →「自动预览切字」或改手动逐字框"
             )
             self.btn_mode_roi.setObjectName("primaryBtn")
             self.btn_mode_char.setObjectName("")
-        # refresh button styles
         self.btn_mode_char.style().unpolish(self.btn_mode_char)
         self.btn_mode_char.style().polish(self.btn_mode_char)
         self.btn_mode_roi.style().unpolish(self.btn_mode_roi)
         self.btn_mode_roi.style().polish(self.btn_mode_roi)
         self._update_box_count()
 
+    def _on_view_changed(self, zoom: float) -> None:
+        self.zoom_label.setText(f"缩放 {zoom:.1f}x")
+
+    def _zoom_to_roi(self) -> None:
+        roi = self.import_canvas.roi()
+        if not roi:
+            QMessageBox.information(self, "提示", "请先拖一个蓝框框住数字区域")
+            return
+        self.import_canvas.zoom_to_rect(roi, margin=0.35)
+        self._status.showMessage("已放大到蓝框 — 可继续滚轮放大，再手动框每个字")
+
+    def _nudge_zoom(self, factor: float) -> None:
+        z = self.import_canvas.zoom_factor() * factor
+        # reuse zoom_to_rect center of current view via fake: set user zoom through wheel-like API
+        c = self.import_canvas
+        c._user_zoom = max(1.0, min(z, 16.0))
+        c._repaint_canvas()
+        c.view_changed.emit(c._user_zoom)
+
     def _on_roi_changed(self, _roi) -> None:
-        # region mode: auto preview after drawing blue box
         if self.import_canvas.mode() == ImageCanvas.MODE_ROI:
             self._auto_preview_boxes()
+            if _roi:
+                self._status.showMessage("已自动放大蓝框区域 — 可改「手动逐字框」继续框小字")
         else:
             self._refresh_import_preview()
+            if _roi:
+                self._status.showMessage("已放大到蓝框 — 滚轮可再放大，然后逐字框选")
 
     def _on_boxes_changed(self, boxes: list) -> None:
         self.crop_count_label.setText(f"字框 {len(boxes)}")
@@ -817,6 +861,7 @@ class MainWindow(QMainWindow):
         if self.import_canvas.mode() == ImageCanvas.MODE_ROI:
             self.import_canvas.clear_boxes()
         self._refresh_import_preview()
+        self.zoom_label.setText("缩放 1.0x")
 
     def _auto_preview_boxes(self) -> None:
         """在蓝框（或整图）内自动生成绿字框。"""

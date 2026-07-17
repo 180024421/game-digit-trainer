@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from PyQt6.QtCore import QPoint, QRect, Qt, pyqtSignal
-from PyQt6.QtGui import QColor, QImage, QPainter, QPen, QPixmap
+from PyQt6.QtCore import QPoint, QPointF, QRect, Qt, pyqtSignal
+from PyQt6.QtGui import QColor, QImage, QPainter, QPen, QPixmap, QWheelEvent
 from PyQt6.QtWidgets import QLabel
 
 
@@ -20,13 +20,14 @@ def numpy_to_pixmap(gray_or_bgr) -> QPixmap:
 
 
 class ImageCanvas(QLabel):
-    """画布：区域模式框数字条；手动切字模式逐个框字符。"""
+    """画布：区域/手动切字 + 滚轮缩放 + 框选后自动放大。"""
 
     MODE_ROI = "roi"
     MODE_CHAR = "char"
 
     roi_changed = pyqtSignal(object)  # tuple[x,y,w,h] | None
-    boxes_changed = pyqtSignal(list)  # list[tuple[x,y,w,h]]
+    boxes_changed = pyqtSignal(list)
+    view_changed = pyqtSignal(float)  # zoom factor relative to fit
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -36,17 +37,21 @@ class ImageCanvas(QLabel):
             "background:#0f172a; color:#94a3b8; border:1px solid #334155; border-radius:8px;"
         )
         self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
         self._src: QPixmap | None = None
         self._boxes: list[tuple[int, int, int, int]] = []
         self._roi: tuple[int, int, int, int] | None = None
         self._drag_origin: QPoint | None = None
         self._drag_current: QPoint | None = None
-        self._scale = 1.0
-        self._offset = QPoint(0, 0)
         self._mode = self.MODE_ROI
         self._draw_stored_roi = True
-        self._hint_roi = "区域模式：拖拽蓝框框住整行数字"
-        self._hint_char = "手动切字：每个字拖一个绿框，从左到右框完再点切字"
+        self._user_zoom = 1.0  # 1=适应窗口
+        self._pan = QPointF(0.0, 0.0)
+        self._panning = False
+        self._pan_last: QPoint | None = None
+        self._auto_zoom_on_roi = True
+        self._hint_roi = "区域模式：拖蓝框框住数字 → 自动放大；滚轮继续缩放，右键拖动平移"
+        self._hint_char = "手动切字：每个字拖一个绿框；滚轮放大，右键拖动画布"
         self.setText(self._hint_roi)
 
     def mode(self) -> str:
@@ -58,12 +63,16 @@ class ImageCanvas(QLabel):
             self.setText(self._hint_char if self._mode == self.MODE_CHAR else self._hint_roi)
         self._repaint_canvas()
 
+    def set_auto_zoom_on_roi(self, enabled: bool) -> None:
+        self._auto_zoom_on_roi = enabled
+
     def clear_image(self) -> None:
         self._src = None
         self._boxes = []
         self._roi = None
         self._drag_origin = None
         self._drag_current = None
+        self.reset_view()
         self.setPixmap(QPixmap())
         self.setText(self._hint_char if self._mode == self.MODE_CHAR else self._hint_roi)
 
@@ -74,12 +83,16 @@ class ImageCanvas(QLabel):
         *,
         draw_stored_roi: bool = True,
         keep_boxes: bool = False,
+        reset_view: bool = False,
     ) -> None:
         self._src = numpy_to_pixmap(arr)
         if boxes is not None and not keep_boxes:
             self._boxes = list(boxes)
         self._draw_stored_roi = draw_stored_roi
-        self._repaint_canvas()
+        if reset_view:
+            self.reset_view()
+        else:
+            self._repaint_canvas()
 
     def set_boxes(self, boxes: list[tuple[int, int, int, int]]) -> None:
         self._boxes = list(boxes)
@@ -98,28 +111,81 @@ class ImageCanvas(QLabel):
             self._repaint_canvas()
             self.boxes_changed.emit(list(self._boxes))
 
-    def set_roi(self, roi: tuple[int, int, int, int] | None) -> None:
+    def set_roi(self, roi: tuple[int, int, int, int] | None, *, auto_zoom: bool | None = None) -> None:
         self._roi = roi
-        self._repaint_canvas()
+        do_zoom = self._auto_zoom_on_roi if auto_zoom is None else auto_zoom
+        if roi and do_zoom:
+            self.zoom_to_rect(roi, margin=0.35)
+        else:
+            self._repaint_canvas()
         self.roi_changed.emit(roi)
 
     def roi(self) -> tuple[int, int, int, int] | None:
         return self._roi
 
     def clear_roi(self) -> None:
-        self.set_roi(None)
+        self._roi = None
+        self.reset_view()
+        self.roi_changed.emit(None)
+
+    def reset_view(self) -> None:
+        self._user_zoom = 1.0
+        self._pan = QPointF(0.0, 0.0)
+        self._repaint_canvas()
+        self.view_changed.emit(self._user_zoom)
+
+    def zoom_to_rect(self, rect: tuple[int, int, int, int], margin: float = 0.3) -> None:
+        """把图像坐标矩形放大到视野中央。"""
+        if self._src is None or self._src.isNull():
+            return
+        x, y, w, h = rect
+        if w < 2 or h < 2:
+            return
+        iw, ih = self._src.width(), self._src.height()
+        pw, ph = max(1, self.width()), max(1, self.height())
+        fit = min(pw / iw, ph / ih)
+        # target: rect (+margin) fills ~70% of view
+        mx = int(w * margin)
+        my = int(h * margin)
+        rw = max(1, w + mx * 2)
+        rh = max(1, h + my * 2)
+        zoom_w = (pw * 0.85) / (rw * fit)
+        zoom_h = (ph * 0.85) / (rh * fit)
+        self._user_zoom = max(1.0, min(zoom_w, zoom_h, 12.0))
+        scale = fit * self._user_zoom
+        cx = x + w / 2
+        cy = y + h / 2
+        # center of widget should map to (cx, cy)
+        # widget_x = offset_x + cx * scale  => offset_x = pw/2 - cx*scale
+        # with pan: offset_x = (pw - iw*scale)/2 + pan_x
+        base_ox = (pw - iw * scale) / 2
+        base_oy = (ph - ih * scale) / 2
+        self._pan = QPointF(pw / 2 - cx * scale - base_ox, ph / 2 - cy * scale - base_oy)
+        self._repaint_canvas()
+        self.view_changed.emit(self._user_zoom)
+
+    def zoom_factor(self) -> float:
+        return self._user_zoom
+
+    def _fit_scale(self) -> float:
+        if self._src is None or self._src.isNull():
+            return 1.0
+        iw, ih = self._src.width(), self._src.height()
+        pw, ph = max(1, self.width()), max(1, self.height())
+        return min(pw / iw, ph / ih)
 
     def _image_rect_on_widget(self) -> QRect | None:
         if self._src is None or self._src.isNull():
             return None
-        pw, ph = self.width(), self.height()
         iw, ih = self._src.width(), self._src.height()
         if iw <= 0 or ih <= 0:
             return None
-        scale = min(pw / iw, ph / ih)
+        fit = self._fit_scale()
+        scale = fit * self._user_zoom
         dw, dh = int(iw * scale), int(ih * scale)
-        x = (pw - dw) // 2
-        y = (ph - dh) // 2
+        pw, ph = self.width(), self.height()
+        x = int((pw - dw) / 2 + self._pan.x())
+        y = int((ph - dh) / 2 + self._pan.y())
         self._scale = scale
         self._offset = QPoint(x, y)
         return QRect(x, y, dw, dh)
@@ -164,7 +230,7 @@ class ImageCanvas(QLabel):
             painter.setPen(pen)
             for i, (bx, by, bw, bh) in enumerate(self._boxes):
                 painter.drawRect(bx, by, bw, bh)
-                painter.drawText(bx + 2, by + 14, str(i + 1))
+                painter.drawText(bx + 2, max(by + 12, 12), str(i + 1))
 
         if self._drag_origin is not None and self._drag_current is not None:
             p0 = self._widget_to_image(self._drag_origin)
@@ -188,31 +254,94 @@ class ImageCanvas(QLabel):
         if target is None:
             self.setPixmap(base)
             return
+        # Draw onto widget-sized pixmap so pan/zoom can go off-center
+        canvas = QPixmap(self.size())
+        canvas.fill(QColor("#0f172a"))
         scaled = base.scaled(
             target.size(),
-            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.AspectRatioMode.IgnoreAspectRatio,
             Qt.TransformationMode.SmoothTransformation,
         )
-        self.setPixmap(scaled)
+        qp = QPainter(canvas)
+        qp.drawPixmap(target.topLeft(), scaled)
+        # zoom badge
+        qp.setPen(QColor(255, 255, 255))
+        qp.drawText(10, 20, f"{self._user_zoom:.1f}x  滚轮缩放 · 右键拖动画布")
+        qp.end()
+        self.setPixmap(canvas)
 
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
         self._repaint_canvas()
 
+    def wheelEvent(self, event: QWheelEvent) -> None:  # noqa: N802
+        if self._src is None or self._src.isNull():
+            return
+        delta = event.angleDelta().y()
+        if delta == 0:
+            return
+        factor = 1.2 if delta > 0 else 1 / 1.2
+        old_zoom = self._user_zoom
+        new_zoom = max(1.0, min(old_zoom * factor, 16.0))
+        if abs(new_zoom - old_zoom) < 1e-6:
+            return
+        # zoom toward cursor
+        pos = event.position().toPoint()
+        before = self._widget_to_image(pos)
+        self._user_zoom = new_zoom
+        self._image_rect_on_widget()
+        if before is not None:
+            # keep image point under cursor
+            # pos.x = offset.x + before.x * scale
+            scale = self._scale
+            iw, ih = self._src.width(), self._src.height()
+            pw, ph = self.width(), self.height()
+            base_ox = (pw - iw * scale) / 2
+            base_oy = (ph - ih * scale) / 2
+            self._pan = QPointF(
+                pos.x() - before.x() * scale - base_ox,
+                pos.y() - before.y() * scale - base_oy,
+            )
+        self._repaint_canvas()
+        self.view_changed.emit(self._user_zoom)
+        event.accept()
+
     def mousePressEvent(self, event) -> None:  # noqa: N802
-        if event.button() != Qt.MouseButton.LeftButton or self._src is None:
+        if self._src is None:
+            return super().mousePressEvent(event)
+        if event.button() in (Qt.MouseButton.RightButton, Qt.MouseButton.MiddleButton):
+            self._panning = True
+            self._pan_last = event.position().toPoint()
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            return
+        if event.button() != Qt.MouseButton.LeftButton:
             return super().mousePressEvent(event)
         self._drag_origin = event.position().toPoint()
         self._drag_current = self._drag_origin
         self._repaint_canvas()
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        if self._panning and self._pan_last is not None:
+            cur = event.position().toPoint()
+            delta = cur - self._pan_last
+            self._pan = QPointF(self._pan.x() + delta.x(), self._pan.y() + delta.y())
+            self._pan_last = cur
+            self._repaint_canvas()
+            return
         if self._drag_origin is None:
             return super().mouseMoveEvent(event)
         self._drag_current = event.position().toPoint()
         self._repaint_canvas()
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        if self._panning and event.button() in (
+            Qt.MouseButton.RightButton,
+            Qt.MouseButton.MiddleButton,
+        ):
+            self._panning = False
+            self._pan_last = None
+            self.unsetCursor()
+            return
         if self._drag_origin is None or event.button() != Qt.MouseButton.LeftButton:
             return super().mouseReleaseEvent(event)
         p0 = self._widget_to_image(self._drag_origin)
@@ -232,4 +361,4 @@ class ImageCanvas(QLabel):
             self._repaint_canvas()
             self.boxes_changed.emit(list(self._boxes))
         else:
-            self.set_roi(box)
+            self.set_roi(box)  # triggers auto zoom
