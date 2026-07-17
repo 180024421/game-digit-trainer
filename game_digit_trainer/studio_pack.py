@@ -6,34 +6,19 @@ from pathlib import Path
 
 EXPORT_FILES = ("digits.onnx", "digits.labels", "manifest.json", "README.txt")
 
-LUA_STUB = '''-- recognize_digits.lua — 由 game-digit-trainer 生成的接入草稿
--- 放到脚本工程后，按 Studio 二期 API 微调函数名即可
+LUA_STUB = '''-- recognize_digits.lua — game-digit-trainer 生成
+-- 推荐直接使用运行时 API：bot.recognizeDigits
 
 local M = {}
 
-local function load_manifest(dir)
-  -- TODO: 读 models/manifest.json
-  return { width = 32, height = 32 }
-end
-
-function M.recognizeDigits(roi, modelsDir)
-  modelsDir = modelsDir or "models"
-  local manifest = load_manifest(modelsDir)
-  local labels = loadLabels(modelsDir .. "/digits.labels")
-  local boxes = segmentChars(roi)
-  local parts = {}
-  for i, box in ipairs(boxes) do
-    local gray = preprocessGray(cropRoi(roi, box), manifest.preprocess)
-    local tensor = resizeNorm(gray, manifest.width, manifest.height)
-    local logits = onnxInfer(modelsDir .. "/digits.onnx", tensor)
-    local idx, conf = argmaxSoftmax(logits)
-    parts[#parts + 1] = { label = labels[idx], conf = conf }
-  end
-  local text = ""
-  for _, p in ipairs(parts) do
-    text = text .. tostring(p.label)
-  end
-  return text, parts
+function M.recognize(roi, model)
+  local r = bot.recognizeDigits({
+    roi = roi,
+    model = model or "models/digits",
+    min_confidence = 0.85,
+    max_gap = 3,
+  })
+  return r.text, r.chars, r.confidence
 end
 
 return M
