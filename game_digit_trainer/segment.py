@@ -89,13 +89,32 @@ def segment_binary(
     return crops
 
 
+def crop_bgr(bgr: np.ndarray, roi: tuple[int, int, int, int] | None) -> np.ndarray:
+    if not roi:
+        return bgr
+    x, y, w, h = roi
+    H, W = bgr.shape[:2]
+    x0 = max(0, min(x, W - 1))
+    y0 = max(0, min(y, H - 1))
+    x1 = max(x0 + 1, min(x + w, W))
+    y1 = max(y0 + 1, min(y + h, H))
+    return bgr[y0:y1, x0:x1].copy()
+
+
 def segment_image(
     path: Path,
     preprocess: PreprocessConfig,
-) -> tuple[np.ndarray, list[CharCrop]]:
+    *,
+    roi: tuple[int, int, int, int] | None = None,
+    max_gap: int = 3,
+    min_area: int = 8,
+) -> tuple[np.ndarray, list[CharCrop], np.ndarray]:
+    """返回 (binary全图或ROI, crops, 用于预览的bgr切片)。crops 坐标相对 binary。"""
     bgr = load_bgr(path)
-    binary = apply_preprocess(bgr, preprocess)
-    return binary, segment_binary(binary)
+    sliced = crop_bgr(bgr, roi)
+    binary = apply_preprocess(sliced, preprocess)
+    crops = segment_binary(binary, min_area=min_area, max_gap=max_gap)
+    return binary, crops, sliced
 
 
 def save_pending_chars(
@@ -133,6 +152,33 @@ def move_to_label(project: GameProject, pending: Path, label: str) -> Path:
         n += 1
     dest.write_bytes(pending.read_bytes())
     pending.unlink(missing_ok=True)
+    return dest
+
+
+def list_dataset_files(project: GameProject, label: str) -> list[Path]:
+    folder = project.dataset_dir / label
+    if not folder.is_dir():
+        return []
+    return sorted(
+        p for p in folder.iterdir() if p.suffix.lower() in {".png", ".jpg", ".jpeg", ".bmp"}
+    )
+
+
+def relabel_dataset_file(project: GameProject, path: Path, new_label: str) -> Path:
+    from game_digit_trainer.labels import normalize_label
+
+    name = normalize_label(new_label)
+    if name not in project.config.classes:
+        raise ValueError(f"项目未启用类别: {name}")
+    dest_dir = project.dataset_dir / name
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / path.name
+    n = 1
+    while dest.exists():
+        dest = dest_dir / f"{path.stem}_{n}{path.suffix}"
+        n += 1
+    dest.write_bytes(path.read_bytes())
+    path.unlink(missing_ok=True)
     return dest
 
 

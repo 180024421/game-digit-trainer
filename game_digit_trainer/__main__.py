@@ -60,7 +60,7 @@ def main(argv: list[str] | None = None) -> int:
         proj = open_project(args.project)
         if args.invert:
             proj.config.preprocess.invert = True
-        _, crops = segment_image(args.image, proj.config.preprocess)
+        _, crops, _ = segment_image(args.image, proj.config.preprocess)
         paths = save_pending_chars(proj, args.image, crops)
         print(f"pending={len(paths)}")
         return 0
