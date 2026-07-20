@@ -28,6 +28,7 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QSpinBox,
     QSplitter,
@@ -80,6 +81,7 @@ from game_digit_trainer.project import (
     RoiPreset,
     SegmentPreset,
     create_project,
+    ensure_dot_class,
     ensure_unit_classes,
     open_project,
     projects_root,
@@ -93,11 +95,26 @@ from game_digit_trainer.segment import (
     move_to_label,
     move_to_pending,
     relabel_dataset_file,
+    resolve_recognize_boxes,
     save_pending_chars,
     segment_binary,
     segment_image,
 )
 from game_digit_trainer.train import train_project
+from game_digit_trainer.train_line import latest_line_checkpoint, train_line_project
+from game_digit_trainer.predict_line import predict_line_roi
+from game_digit_trainer.line_data import (
+    LINE_DATASET_KEY,
+    clear_line_samples,
+    confirm_line_pending,
+    count_line_labeled,
+    delete_line_sample,
+    list_line_labeled,
+    list_line_pending,
+    save_line_pending,
+    save_line_sample,
+    update_line_label,
+)
 
 
 class TrainWorker(QThread):
@@ -105,20 +122,35 @@ class TrainWorker(QThread):
     done = pyqtSignal(str)
     failed = pyqtSignal(str)
 
-    def __init__(self, project: GameProject, epochs: int, *, augment: bool = True) -> None:
+    def __init__(
+        self,
+        project: GameProject,
+        epochs: int,
+        *,
+        augment: bool = True,
+        line_mode: bool = False,
+    ) -> None:
         super().__init__()
         self.project = project
         self.epochs = epochs
         self.augment = augment
+        self.line_mode = line_mode
 
     def run(self) -> None:
         try:
-            path = train_project(
-                self.project,
-                epochs=self.epochs,
-                augment=self.augment,
-                log=lambda m: self.log.emit(m),
-            )
+            if self.line_mode:
+                path = train_line_project(
+                    self.project,
+                    epochs=self.epochs,
+                    log=lambda m: self.log.emit(m),
+                )
+            else:
+                path = train_project(
+                    self.project,
+                    epochs=self.epochs,
+                    augment=self.augment,
+                    log=lambda m: self.log.emit(m),
+                )
             self.done.emit(str(path))
         except Exception as exc:
             self.failed.emit(f"{exc}\n{traceback.format_exc()}")
@@ -143,9 +175,11 @@ class MainWindow(QMainWindow):
         self._pred_conf: float = 0.0
         self._current_import: Path | None = None
         self._region_overlay = None
-        self._review_mode = "pending"  # pending | labeled
+        self._review_mode = "pending"  # pending | labeled | hard | line
         self._labeled: list[tuple[Path, str]] = []
         self._labeled_idx = 0
+        self._line_pending: list[Path] = []
+        self._line_idx = 0
         self._undo_stack: list[dict] = []
         self._last_labeled_path: Path | None = None
         self._batch_confirming = False
@@ -229,7 +263,8 @@ class MainWindow(QMainWindow):
         lay.addWidget(self.template_combo)
         self.chk_units = QCheckBox("万/亿")
         self.chk_units.setChecked(True)
-        self.chk_symbols = QCheckBox(",/%:")
+        self.chk_symbols = QCheckBox(".,/%:")
+        self.chk_symbols.setToolTip("新建时启用小数点、逗号、斜杠、百分号、冒号")
         lay.addWidget(self.chk_units)
         lay.addWidget(self.chk_symbols)
 
@@ -237,15 +272,19 @@ class MainWindow(QMainWindow):
         btn_open = QPushButton("打开…")
         btn_folder = QPushButton("文件夹")
         btn_units = QPushButton("+万/亿")
+        btn_dot = QPushButton("+小数点")
+        btn_dot.setToolTip("给当前项目追加小数点「.」类别（已有工程缺小数点时点这个）")
         btn_new.setObjectName("primaryBtn")
         btn_new.clicked.connect(self._new_project)
         btn_open.clicked.connect(self._open_project_dialog)
         btn_folder.clicked.connect(self._open_project_folder)
         btn_units.clicked.connect(self._add_units_to_project)
+        btn_dot.clicked.connect(self._add_dot_to_project)
         lay.addWidget(btn_new)
         lay.addWidget(btn_open)
         lay.addWidget(btn_folder)
         lay.addWidget(btn_units)
+        lay.addWidget(btn_dot)
         return bar
 
     def _build_work(self) -> None:
@@ -303,7 +342,19 @@ class MainWindow(QMainWindow):
         layout.addWidget(splitter, 1)
 
         mid = QWidget()
-        mid_l = QVBoxLayout(mid)
+        mid_outer = QVBoxLayout(mid)
+        mid_outer.setContentsMargins(0, 0, 0, 0)
+        mid_outer.setSpacing(0)
+
+        self.work_scroll = QScrollArea()
+        self.work_scroll.setWidgetResizable(True)
+        self.work_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.work_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.work_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        mid_outer.addWidget(self.work_scroll)
+
+        scroll_body = QWidget()
+        mid_l = QVBoxLayout(scroll_body)
         mid_l.setContentsMargins(0, 0, 0, 0)
 
         mode_row = QHBoxLayout()
@@ -311,6 +362,8 @@ class MainWindow(QMainWindow):
         self.btn_mode_roi = QPushButton("整行蓝框")
         self.btn_mode_char = QPushButton("逐字绿框（推荐）")
         self.btn_mode_char.setObjectName("primaryBtn")
+        self.btn_mode_roi.setToolTip("识别用：圈一整段数字（如 3920万），再点预览/验模型即可出整串")
+        self.btn_mode_char.setToolTip("训练用：每个数字拖一个绿框，再确认切字进审核")
         self.btn_mode_roi.clicked.connect(lambda: self._set_cut_mode("roi"))
         self.btn_mode_char.clicked.connect(lambda: self._set_cut_mode("char"))
         mode_row.addWidget(self.btn_mode_roi)
@@ -325,11 +378,18 @@ class MainWindow(QMainWindow):
         btn_clear_boxes.clicked.connect(self._clear_char_boxes)
         btn_seg = QPushButton("确认切字 Enter")
         btn_seg.setObjectName("successBtn")
-        btn_seg.setToolTip("快捷键 Enter")
+        btn_seg.setToolTip("快捷键 Enter：按绿框切成单字进待审")
         btn_seg.clicked.connect(self._segment_current)
+        btn_line_pending = QPushButton("加入行待审")
+        btn_line_pending.setObjectName("primaryBtn")
+        btn_line_pending.setToolTip(
+            "用「整行蓝框」圈住数字后点此：整行进 ② 行待审，稍后填整串文字（不切字）"
+        )
+        btn_line_pending.clicked.connect(self._add_line_pending)
         mode_row.addWidget(btn_undo)
         mode_row.addWidget(btn_clear_boxes)
         mode_row.addWidget(btn_seg)
+        mode_row.addWidget(btn_line_pending)
         mid_l.addLayout(mode_row)
 
         self.work_hint = QLabel(
@@ -339,73 +399,7 @@ class MainWindow(QMainWindow):
         self.work_hint.setWordWrap(True)
         mid_l.addWidget(self.work_hint)
 
-        self.import_canvas = ImageCanvas()
-        self.import_canvas.setMinimumHeight(280)
-        self.import_canvas.roi_changed.connect(self._on_roi_changed)
-        self.import_canvas.boxes_changed.connect(self._on_boxes_changed)
-        self.import_canvas.view_changed.connect(self._on_view_changed)
-        self.import_canvas.selection_changed.connect(self._on_box_selection_changed)
-        mid_l.addWidget(self.import_canvas, 1)
-
-        self.preview_big = QLabel("识别预览：框选数字后点「预览识别」")
-        self.preview_big.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.preview_big.setFixedHeight(44)
-        self.preview_big.setStyleSheet(
-            "background:#111827; color:#fbbf24; border-radius:10px; font-size:22px; font-weight:800; padding:4px;"
-        )
-        mid_l.addWidget(self.preview_big)
-
-        # 选中字框：单行紧凑（避免再挤掉画布高度导致截图顶部被裁）
-        sel_bar = QHBoxLayout()
-        sel_bar.setContentsMargins(0, 0, 0, 0)
-        self.selected_crop_preview = QLabel("未选")
-        self.selected_crop_preview.setFixedSize(56, 56)
-        self.selected_crop_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.selected_crop_preview.setStyleSheet(
-            "background:#0b1220; color:#94a3b8; border:2px solid #64748b; "
-            "border-radius:6px; font-size:11px;"
-        )
-        self.selected_crop_preview.setToolTip("当前选中字框放大预览")
-        sel_bar.addWidget(self.selected_crop_preview)
-        self.selected_box_label = QLabel("点绿框选中后可改宽高")
-        self.selected_box_label.setObjectName("hintLabel")
-        sel_bar.addWidget(self.selected_box_label)
-        sel_bar.addWidget(QLabel("宽"))
-        self.box_w_spin = QSpinBox()
-        self.box_w_spin.setRange(2, 400)
-        self.box_w_spin.setEnabled(False)
-        self.box_w_spin.setFixedWidth(64)
-        self.box_w_spin.setToolTip("精确调整选中字框宽度（像素）")
-        self.box_w_spin.valueChanged.connect(self._on_box_size_spin)
-        sel_bar.addWidget(self.box_w_spin)
-        btn_w_minus = QPushButton("窄")
-        btn_w_minus.setFixedWidth(32)
-        btn_w_minus.clicked.connect(lambda: self._nudge_selected_size(dw=-1))
-        btn_w_plus = QPushButton("宽+")
-        btn_w_plus.setFixedWidth(36)
-        btn_w_plus.clicked.connect(lambda: self._nudge_selected_size(dw=1))
-        sel_bar.addWidget(btn_w_minus)
-        sel_bar.addWidget(btn_w_plus)
-        sel_bar.addWidget(QLabel("高"))
-        self.box_h_spin = QSpinBox()
-        self.box_h_spin.setRange(2, 400)
-        self.box_h_spin.setEnabled(False)
-        self.box_h_spin.setFixedWidth(64)
-        self.box_h_spin.setToolTip("精确调整选中字框高度（像素）")
-        self.box_h_spin.valueChanged.connect(self._on_box_size_spin)
-        sel_bar.addWidget(self.box_h_spin)
-        btn_h_minus = QPushButton("矮")
-        btn_h_minus.setFixedWidth(32)
-        btn_h_minus.clicked.connect(lambda: self._nudge_selected_size(dh=-1))
-        btn_h_plus = QPushButton("高+")
-        btn_h_plus.setFixedWidth(36)
-        btn_h_plus.clicked.connect(lambda: self._nudge_selected_size(dh=1))
-        sel_bar.addWidget(btn_h_minus)
-        sel_bar.addWidget(btn_h_plus)
-        sel_bar.addStretch()
-        mid_l.addLayout(sel_bar)
-        self._syncing_box_spins = False
-
+        # 工具 / 验模型 / 高级选项放在画布上方，避免被画布挤出窗口
         main_tools = QHBoxLayout()
         self.btn_mode_draw = QPushButton("画框")
         self.btn_mode_pan = QPushButton("拖图")
@@ -429,7 +423,10 @@ class MainWindow(QMainWindow):
         main_tools.addWidget(self.gap_spin)
         btn_preview = QPushButton("预览识别")
         btn_preview.setObjectName("primaryBtn")
-        btn_preview.setToolTip("用当前工程最新 checkpoint 识别绿框（训练中快速试跑）")
+        btn_preview.setToolTip(
+            "框蓝框（或一个很宽的区域框）即可识别整串；内部用自动切字+单字模型。"
+            "多个细绿框则按手调字框识别。训练仍请逐字框选。"
+        )
         btn_preview.clicked.connect(self._preview_recognize)
         btn_split = QPushButton("拆粘连")
         btn_split.setToolTip("点选绿框后拆开；未选中时自动拆最宽的框")
@@ -440,13 +437,12 @@ class MainWindow(QMainWindow):
         main_tools.addStretch()
         mid_l.addLayout(main_tools)
 
-        # 验模型：常驻，可切换 / 浏览外部 ONNX（其它电脑导出的包）
         verify_box = QGroupBox("验模型（可选导出 ONNX 或本机 checkpoint）")
         verify_l = QVBoxLayout(verify_box)
         verify_row = QHBoxLayout()
         verify_row.addWidget(QLabel("模型"))
         self.verify_model_combo = QComboBox()
-        self.verify_model_combo.setMinimumWidth(220)
+        self.verify_model_combo.setMinimumWidth(200)
         self.verify_model_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.verify_model_combo.setToolTip("列表含本工程 exports、runs，以及你浏览过的外部 ONNX 包")
         btn_verify_refresh = QPushButton("刷新")
@@ -457,45 +453,30 @@ class MainWindow(QMainWindow):
         btn_verify_browse.clicked.connect(self._browse_verify_onnx)
         btn_verify_run = QPushButton("用所选模型识别")
         btn_verify_run.setObjectName("primaryBtn")
-        btn_verify_run.setToolTip("对当前截图绿字框/蓝 ROI 用下拉所选模型推理")
+        btn_verify_run.setToolTip(
+            "对当前蓝框/宽区域自动切字后用所选模型识别整串；多个细绿框则按字框识别"
+        )
         btn_verify_run.clicked.connect(self._verify_recognize_selected)
         verify_row.addWidget(self.verify_model_combo, 1)
         verify_row.addWidget(btn_verify_refresh)
         verify_row.addWidget(btn_verify_browse)
         verify_row.addWidget(btn_verify_run)
         verify_l.addLayout(verify_row)
-        self.verify_hint = QLabel("可加载外部导出包；圈选区域后点「用所选模型识别」。")
+        self.verify_hint = QLabel(
+            "有「行模型」时：蓝框圈数字行 → 识别整串（不切字）。无行模型时回退单字切字识别。"
+            " ③训练页可点「训练行模型」。"
+        )
         self.verify_hint.setObjectName("hintLabel")
         self.verify_hint.setWordWrap(True)
         verify_l.addWidget(self.verify_hint)
         mid_l.addWidget(verify_box)
 
-        gold_row = QHBoxLayout()
-        gold_row.addWidget(QLabel("金标"))
-        self.gold_edit = QLineEdit()
-        self.gold_edit.setPlaceholderText("例如 1234万 或 2:03 — 与预览对比，错字进难例/待审")
-        btn_gold = QPushButton("对比回流")
-        btn_gold.clicked.connect(self._gold_compare_reflow)
-        btn_reg_add = QPushButton("加入回归集")
-        btn_reg_add.setToolTip("把当前图+金标存为固定回归用例")
-        btn_reg_add.clicked.connect(self._add_regression_case)
-        gold_row.addWidget(self.gold_edit, 1)
-        gold_row.addWidget(btn_gold)
-        gold_row.addWidget(btn_reg_add)
-        mid_l.addLayout(gold_row)
-
-        self.trial_result = QLabel("预览明细：训练后可用")
-        self.trial_result.setObjectName("hintLabel")
-        self.trial_result.setWordWrap(True)
-        mid_l.addWidget(self.trial_result)
-
-        # 高级选项：独立一行大按钮，收起后仍在原处可再展开
         more_toggle_row = QHBoxLayout()
         self.btn_more = QPushButton("高级选项 ▾（ROI 预设 / 缩放 / 定时刷样…）")
         self.btn_more.setCheckable(True)
         self.btn_more.setChecked(False)
         self.btn_more.setMinimumHeight(36)
-        self.btn_more.setToolTip("展开或收起进阶工具；按钮始终留在此行，不会消失")
+        self.btn_more.setToolTip("展开或收起进阶工具；内容变长时可上下滚动查看")
         self.btn_more.toggled.connect(self._toggle_work_more)
         more_toggle_row.addWidget(self.btn_more)
         mid_l.addLayout(more_toggle_row)
@@ -511,7 +492,7 @@ class MainWindow(QMainWindow):
         btn_zoom_in = QPushButton("+")
         btn_zoom_out = QPushButton("-")
         btn_zoom_roi.clicked.connect(self._zoom_to_roi)
-        btn_zoom_fit.clicked.connect(self.import_canvas.reset_view)
+        btn_zoom_fit.clicked.connect(lambda: self.import_canvas.reset_view())
         btn_zoom_in.clicked.connect(lambda: self._nudge_zoom(1.25))
         btn_zoom_out.clicked.connect(lambda: self._nudge_zoom(0.8))
         zoom_row.addWidget(self.zoom_label)
@@ -642,6 +623,103 @@ class MainWindow(QMainWindow):
         self._auto_roi_timer = QTimer(self)
         self._auto_roi_timer.timeout.connect(self._auto_roi_tick)
 
+        self.import_canvas = ImageCanvas()
+        self.import_canvas.setMinimumHeight(280)
+        self.import_canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.MinimumExpanding)
+        self.import_canvas.roi_changed.connect(self._on_roi_changed)
+        self.import_canvas.boxes_changed.connect(self._on_boxes_changed)
+        self.import_canvas.view_changed.connect(self._on_view_changed)
+        self.import_canvas.selection_changed.connect(self._on_box_selection_changed)
+        mid_l.addWidget(self.import_canvas)
+
+        work_footer = QWidget()
+        work_footer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        foot_l = QVBoxLayout(work_footer)
+        foot_l.setContentsMargins(0, 4, 0, 0)
+        foot_l.setSpacing(4)
+
+        self.preview_big = QLabel("识别预览：框选数字后点「预览识别」或「用所选模型识别」")
+        self.preview_big.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.preview_big.setMinimumHeight(44)
+        self.preview_big.setStyleSheet(
+            "background:#111827; color:#fbbf24; border-radius:10px; font-size:22px; font-weight:800; padding:4px;"
+        )
+        foot_l.addWidget(self.preview_big)
+
+        sel_bar = QHBoxLayout()
+        sel_bar.setContentsMargins(0, 0, 0, 0)
+        self.selected_crop_preview = QLabel("未选")
+        self.selected_crop_preview.setFixedSize(48, 48)
+        self.selected_crop_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.selected_crop_preview.setStyleSheet(
+            "background:#0b1220; color:#94a3b8; border:2px solid #64748b; "
+            "border-radius:6px; font-size:11px;"
+        )
+        self.selected_crop_preview.setToolTip("当前选中字框放大预览")
+        sel_bar.addWidget(self.selected_crop_preview)
+        self.selected_box_label = QLabel("点绿框选中后可改宽高")
+        self.selected_box_label.setObjectName("hintLabel")
+        sel_bar.addWidget(self.selected_box_label)
+        sel_bar.addWidget(QLabel("宽"))
+        self.box_w_spin = QSpinBox()
+        self.box_w_spin.setRange(2, 400)
+        self.box_w_spin.setEnabled(False)
+        self.box_w_spin.setFixedWidth(64)
+        self.box_w_spin.valueChanged.connect(self._on_box_size_spin)
+        sel_bar.addWidget(self.box_w_spin)
+        btn_w_minus = QPushButton("窄")
+        btn_w_minus.setFixedWidth(32)
+        btn_w_minus.clicked.connect(lambda: self._nudge_selected_size(dw=-1))
+        btn_w_plus = QPushButton("宽+")
+        btn_w_plus.setFixedWidth(36)
+        btn_w_plus.clicked.connect(lambda: self._nudge_selected_size(dw=1))
+        sel_bar.addWidget(btn_w_minus)
+        sel_bar.addWidget(btn_w_plus)
+        sel_bar.addWidget(QLabel("高"))
+        self.box_h_spin = QSpinBox()
+        self.box_h_spin.setRange(2, 400)
+        self.box_h_spin.setEnabled(False)
+        self.box_h_spin.setFixedWidth(64)
+        self.box_h_spin.valueChanged.connect(self._on_box_size_spin)
+        sel_bar.addWidget(self.box_h_spin)
+        btn_h_minus = QPushButton("矮")
+        btn_h_minus.setFixedWidth(32)
+        btn_h_minus.clicked.connect(lambda: self._nudge_selected_size(dh=-1))
+        btn_h_plus = QPushButton("高+")
+        btn_h_plus.setFixedWidth(36)
+        btn_h_plus.clicked.connect(lambda: self._nudge_selected_size(dh=1))
+        sel_bar.addWidget(btn_h_minus)
+        sel_bar.addWidget(btn_h_plus)
+        sel_bar.addStretch()
+        foot_l.addLayout(sel_bar)
+        self._syncing_box_spins = False
+
+        gold_row = QHBoxLayout()
+        gold_row.addWidget(QLabel("金标"))
+        self.gold_edit = QLineEdit()
+        self.gold_edit.setPlaceholderText("例如 1.2万 或 2:03 — 与预览对比，错字进难例/待审")
+        btn_gold = QPushButton("对比回流")
+        btn_gold.clicked.connect(self._gold_compare_reflow)
+        btn_reg_add = QPushButton("加入回归集")
+        btn_reg_add.setToolTip("把当前图+金标存为固定回归用例")
+        btn_reg_add.clicked.connect(self._add_regression_case)
+        btn_line_save = QPushButton("存行样本")
+        btn_line_save.setToolTip("把当前蓝框/宽框 + 金标存入 lines/，供行模型训练（推荐多存真实 HUD）")
+        btn_line_save.clicked.connect(self._save_line_sample)
+        gold_row.addWidget(self.gold_edit, 1)
+        gold_row.addWidget(btn_gold)
+        gold_row.addWidget(btn_reg_add)
+        gold_row.addWidget(btn_line_save)
+        foot_l.addLayout(gold_row)
+
+        self.trial_result = QLabel("预览明细：训练后 / 验模型后显示")
+        self.trial_result.setObjectName("hintLabel")
+        self.trial_result.setWordWrap(True)
+        foot_l.addWidget(self.trial_result)
+
+        mid_l.addWidget(work_footer)
+
+        self.work_scroll.setWidget(scroll_body)
         splitter.addWidget(mid)
 
         self._set_cut_mode("char")
@@ -671,11 +749,15 @@ class MainWindow(QMainWindow):
         self.btn_rev_pending = QPushButton('待审')
         self.btn_rev_labeled = QPushButton('已标注（可改）')
         self.btn_rev_hard = QPushButton('难例')
+        self.btn_rev_line = QPushButton('行待审')
+        self.btn_rev_line.setToolTip('整行框选后的待标样本：填整串文字确认即可')
         self.btn_rev_pending.setObjectName('primaryBtn')
         self.btn_rev_pending.clicked.connect(lambda: self._set_review_mode('pending'))
         self.btn_rev_labeled.clicked.connect(lambda: self._set_review_mode('labeled'))
         self.btn_rev_hard.clicked.connect(lambda: self._set_review_mode('hard'))
+        self.btn_rev_line.clicked.connect(lambda: self._set_review_mode('line'))
         mode_row.addWidget(self.btn_rev_pending)
+        mode_row.addWidget(self.btn_rev_line)
         mode_row.addWidget(self.btn_rev_labeled)
         mode_row.addWidget(self.btn_rev_hard)
         gallery.addLayout(mode_row)
@@ -684,8 +766,13 @@ class MainWindow(QMainWindow):
         self.gallery_title = QLabel('待审预览（点击选择）')
         btn_reload = QPushButton('刷新')
         btn_reload.clicked.connect(self._reload_review_lists)
+        btn_clear_pending = QPushButton('清空列表')
+        btn_clear_pending.setObjectName('dangerBtn')
+        btn_clear_pending.setToolTip('清空当前列表：待审全部 / 难例全部（已标注请用右侧样本库删除）')
+        btn_clear_pending.clicked.connect(self._clear_review_gallery)
         gal_head.addWidget(self.gallery_title)
         gal_head.addWidget(btn_reload)
+        gal_head.addWidget(btn_clear_pending)
         gallery.addLayout(gal_head)
 
         self.pending_list = QListWidget()
@@ -759,6 +846,17 @@ class MainWindow(QMainWindow):
         self.btn_confirm.clicked.connect(self._confirm_prediction)
         right.addWidget(self.btn_confirm)
 
+        self.line_label_edit = QLineEdit()
+        self.line_label_edit.setPlaceholderText("行待审：填写整串，例如 3920万 或 1.9亿")
+        self.line_label_edit.setVisible(False)
+        self.line_label_edit.returnPressed.connect(self._confirm_line_pending)
+        right.addWidget(self.line_label_edit)
+        self.btn_line_confirm = QPushButton("确认行标注 Enter")
+        self.btn_line_confirm.setObjectName("successBtn")
+        self.btn_line_confirm.setVisible(False)
+        self.btn_line_confirm.clicked.connect(self._confirm_line_pending)
+        right.addWidget(self.btn_line_confirm)
+
         conf_row = QHBoxLayout()
         self.chk_batch_confirm = QCheckBox('批量确认（≥阈值连过）')
         self.chk_batch_confirm.setChecked(True)
@@ -810,7 +908,15 @@ class MainWindow(QMainWindow):
         right.addWidget(QLabel('单位 / 符号'))
         unit_row = QHBoxLayout()
         self._unit_btns = {}
-        for text, lab in [('万 W', '万'), ('亿 Y', '亿'), (',', ','), ('/', '/'), ('%', '%'), (':', ':')]:
+        for text, lab in [
+            ("万 W", "万"),
+            ("亿 Y", "亿"),
+            (".", "."),
+            (",", ","),
+            ("/", "/"),
+            ("%", "%"),
+            (":", ":"),
+        ]:
             b = QPushButton(text)
             b.setObjectName('unitBtn')
             b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -866,6 +972,9 @@ class MainWindow(QMainWindow):
             sc = QShortcut(QKeySequence(key), self)
             sc.setContext(Qt.ShortcutContext.WindowShortcut)
             sc.activated.connect(lambda lab=lab: self._review_only(lambda: self._assign(lab)))
+        sc_dot = QShortcut(QKeySequence(Qt.Key.Key_Period), self)
+        sc_dot.setContext(Qt.ShortcutContext.WindowShortcut)
+        sc_dot.activated.connect(lambda: self._review_only(lambda: self._assign(".")))
         sc = QShortcut(QKeySequence('Ctrl+Z'), self)
         sc.setContext(Qt.ShortcutContext.WindowShortcut)
         sc.activated.connect(self._undo_contextual)
@@ -905,10 +1014,19 @@ class MainWindow(QMainWindow):
         self.chk_force_export = QCheckBox("强制导出")
         self.chk_force_export.setToolTip("忽略质量门禁（样本不足/准确率偏低）")
         form.addWidget(self.chk_force_export)
-        btn_train = QPushButton("开始训练")
+        btn_train = QPushButton("开始训练（单字）")
         btn_train.setObjectName("primaryBtn")
+        btn_train.setToolTip("按 dataset 单字目录训练 CNN（审核切字用）")
         btn_train.clicked.connect(self._start_train)
         form.addWidget(btn_train)
+        btn_train_line = QPushButton("训练行模型")
+        btn_train_line.setObjectName("successBtn")
+        btn_train_line.setToolTip(
+            "优先用「行样本」整行图训练；没有单字库也可以。"
+            "若有单字库会额外合成行图。识别时蓝框一次出整串。"
+        )
+        btn_train_line.clicked.connect(self._start_train_line)
+        form.addWidget(btn_train_line)
         form.addStretch()
         left.addWidget(box)
 
@@ -967,12 +1085,19 @@ class MainWindow(QMainWindow):
         left.addLayout(bal_row)
         layout.addLayout(left, 2)
 
-        # dataset browser embedded
+        # dataset browser embedded（含【行样本】）
         right = QGroupBox("样本库（改错/删除）")
         rl = QVBoxLayout(right)
+        hint = QLabel(
+            "行模型主用「行样本」。左侧选【行样本】可改金标/删除；"
+            "没有单字也能训行模型。单字类仅用于可选合成增强，或旧单字模型。"
+        )
+        hint.setObjectName("hintLabel")
+        hint.setWordWrap(True)
+        rl.addWidget(hint)
         row = QHBoxLayout()
         self.ds_class_list = QListWidget()
-        self.ds_class_list.setMaximumWidth(120)
+        self.ds_class_list.setMaximumWidth(140)
         self.ds_class_list.currentTextChanged.connect(self._on_ds_class)
         self.ds_file_list = QListWidget()
         self.ds_file_list.currentRowChanged.connect(self._on_ds_file)
@@ -986,18 +1111,36 @@ class MainWindow(QMainWindow):
         self.ds_preview.setStyleSheet("background:#111827; color:#9ca3af; border-radius:8px;")
         rl.addWidget(self.ds_preview)
 
+        line_edit_row = QHBoxLayout()
+        self.ds_line_edit = QLineEdit()
+        self.ds_line_edit.setPlaceholderText("行样本金标，例如 3920万")
+        self.ds_line_edit.setVisible(False)
+        self.ds_line_edit.returnPressed.connect(self._ds_update_line_label)
+        btn_line_relabel = QPushButton("改金标")
+        btn_line_relabel.setVisible(False)
+        btn_line_relabel.clicked.connect(self._ds_update_line_label)
+        self.btn_ds_line_relabel = btn_line_relabel
+        line_edit_row.addWidget(self.ds_line_edit, 1)
+        line_edit_row.addWidget(btn_line_relabel)
+        rl.addLayout(line_edit_row)
+
         move_row = QHBoxLayout()
         self.ds_move_combo = QComboBox()
-        btn_move = QPushButton("改到此类")
+        self.btn_ds_move = QPushButton("改到此类")
         btn_del = QPushButton("删除")
         btn_del.setObjectName("dangerBtn")
-        btn_move.clicked.connect(self._ds_move)
+        btn_clear_cls = QPushButton("清空本类")
+        btn_clear_cls.setObjectName("dangerBtn")
+        btn_clear_cls.setToolTip("单字：清空当前类；行样本：清空全部已标行图")
+        self.btn_ds_move.clicked.connect(self._ds_move)
         btn_del.clicked.connect(self._ds_delete)
+        btn_clear_cls.clicked.connect(self._ds_clear_class)
         btn_refresh = QPushButton("刷新")
         btn_refresh.clicked.connect(self._reload_dataset_browser)
         move_row.addWidget(self.ds_move_combo, 1)
-        move_row.addWidget(btn_move)
+        move_row.addWidget(self.btn_ds_move)
         move_row.addWidget(btn_del)
+        move_row.addWidget(btn_clear_cls)
         move_row.addWidget(btn_refresh)
         rl.addLayout(move_row)
         layout.addWidget(right, 2)
@@ -1047,7 +1190,9 @@ class MainWindow(QMainWindow):
 
     def _goto_review(self) -> None:
         self.tabs.setCurrentIndex(self.TAB_REVIEW)
-        if (
+        if self.project and list_line_pending(self.project):
+            self._set_review_mode("line")
+        elif (
             self.project
             and not self.project.pending_files()
             and sum(self.project.class_counts().values()) > 0
@@ -1066,9 +1211,13 @@ class MainWindow(QMainWindow):
             self.badge_pending.setVisible(False)
             return
         n = len(self.project.pending_files())
+        line_n = len(list_line_pending(self.project))
         labeled_n = sum(self.project.class_counts().values())
         self.project_title.setText(f"项目：{self.project.config.game_id}")
-        if n > 0:
+        if line_n > 0:
+            self.badge_pending.setText(f"行待审 {line_n}（点此标注）")
+            self.badge_pending.setVisible(True)
+        elif n > 0:
             self.badge_pending.setText(f"待审 {n}（点此标注）")
             self.badge_pending.setVisible(True)
         elif labeled_n > 0:
@@ -1077,7 +1226,9 @@ class MainWindow(QMainWindow):
         else:
             self.badge_pending.setVisible(False)
         tab = "② 审核标注"
-        if n:
+        if line_n:
+            tab = f"② 审核标注（行待审{line_n}）"
+        elif n:
             tab = f"② 审核标注（待审{n}）"
         elif labeled_n:
             tab = f"② 审核标注（已标{labeled_n}）"
@@ -1184,17 +1335,24 @@ class MainWindow(QMainWindow):
             return
         counts = self.project.class_counts()
         total = sum(counts.values())
+        line_n = count_line_labeled(self.project)
+        line_pending_n = len(list_line_pending(self.project))
         lines = [
             f"路径: {self.project.root}",
             f"类别: {' '.join(display_label(c) for c in self.project.config.classes)}",
-            f"已标注样本: {total} · 待审核: {len(self.project.pending_files())}",
+            f"单字已标: {total} · 单字待审: {len(self.project.pending_files())}",
+            f"行样本已标: {line_n} · 行待审: {line_pending_n}",
             "",
         ]
         for k, v in counts.items():
             if v:
                 lines.append(f"  {display_label(k)}: {v}")
+        if line_n:
+            lines.append(f"  【行样本】: {line_n}（右侧样本库可改/删）")
         ckpt = latest_checkpoint(self.project)
-        lines.append(f"模型: {ckpt.parent.name if ckpt else '尚未训练'}")
+        line_ckpt = latest_line_checkpoint(self.project)
+        lines.append(f"单字模型: {ckpt.parent.name if ckpt else '尚未训练'}")
+        lines.append(f"行模型: {line_ckpt.parent.name if line_ckpt else '尚未训练（③点「训练行模型」）'}")
         lines.append("")
         lines.append(format_balance_text(counts))
         self.project_info.setPlainText("\n".join(lines))
@@ -1213,6 +1371,22 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "已添加", "已加入「万 / 亿」，审核时用 W / Y 标注")
         else:
             QMessageBox.information(self, "提示", "本项目已有万/亿")
+
+    def _add_dot_to_project(self) -> None:
+        proj = self._require_project()
+        if not proj:
+            return
+        added = ensure_dot_class(proj)
+        self._refresh_project_info()
+        self._reload_dataset_browser()
+        if added:
+            QMessageBox.information(
+                self,
+                "已添加",
+                "已加入小数点「.」。请补标含小数点的样本后重新训练/导出。\n审核页可点「.」或键盘句号键。",
+            )
+        else:
+            QMessageBox.information(self, "提示", "本项目已有小数点类别")
 
     # ---------- capture / import ----------
     def _capture_dest_dir(self) -> Path | None:
@@ -1517,25 +1691,37 @@ class MainWindow(QMainWindow):
         try:
             self._apply_preprocess_ui()
             bgr = load_bgr(self._current_import)
+            from game_digit_trainer.segment import boxes_from_region
+
             roi = self.import_canvas.roi()
-            sliced = crop_bgr(bgr, roi)
-            binary = apply_preprocess(sliced, self.project.config.preprocess)
-            crops = segment_binary(binary, max_gap=self.gap_spin.value())
-            ox = roi[0] if roi else 0
-            oy = roi[1] if roi else 0
-            boxes = [(c.x + ox, c.y + oy, c.w, c.h) for c in crops]
-            fixed, tips = auto_fix_boxes(boxes)
+            fixed = boxes_from_region(
+                bgr,
+                roi,
+                self.project.config.preprocess,
+                max_gap=self.gap_spin.value(),
+            )
             self.import_canvas.set_boxes(fixed)
             self._refresh_import_preview(keep_manual_boxes=True)
             gap = self.gap_spin.value()
-            tip = ""
-            if tips:
-                tip = f"；建议拆粘连：第 {', '.join(str(i + 1) for i in tips[:5])} 框偏宽"
-            self._status.showMessage(
-                f"自动预览 {len(fixed)} 个字框（间距={gap}，已修碎框）{tip}"
-            )
+            self._status.showMessage(f"自动预览 {len(fixed)} 个字框（间距={gap}）")
         except Exception as exc:
             QMessageBox.warning(self, "自动切字失败", str(exc))
+
+    def _prepare_recognize_boxes(self, bgr) -> list[tuple[int, int, int, int]]:
+        """识别前解析字框：区域优先自动切；多细绿框用手调。"""
+        assert self.project is not None
+        self._apply_preprocess_ui()
+        boxes, mode = resolve_recognize_boxes(
+            bgr,
+            preprocess=self.project.config.preprocess,
+            roi=self.import_canvas.roi(),
+            boxes=list(self.import_canvas.boxes()),
+            max_gap=int(self.gap_spin.value()),
+        )
+        if boxes and mode in {"roi", "wide_box", "full"}:
+            self.import_canvas.set_boxes(boxes)
+            self._update_box_count()
+        return boxes
 
     def _refresh_import_preview(self, keep_manual_boxes: bool = False) -> None:
         del keep_manual_boxes
@@ -1637,23 +1823,45 @@ class MainWindow(QMainWindow):
 
     # ---------- review ----------
     def _set_review_mode(self, mode: str) -> None:
-        self._review_mode = mode if mode in ("pending", "labeled", "hard") else "pending"
+        self._review_mode = mode if mode in ("pending", "labeled", "hard", "line") else "pending"
         self.btn_rev_pending.setObjectName("primaryBtn" if self._review_mode == "pending" else "")
         self.btn_rev_labeled.setObjectName("primaryBtn" if self._review_mode == "labeled" else "")
         if hasattr(self, "btn_rev_hard"):
             self.btn_rev_hard.setObjectName("primaryBtn" if self._review_mode == "hard" else "")
-        if self._review_mode == "pending":
-            self.gallery_title.setText("待审预览（点击选择）")
-        elif self._review_mode == "labeled":
-            self.gallery_title.setText("已标注（点选后可改标/退回）")
-        else:
-            self.gallery_title.setText("难例（低置信/改标/金标失败）")
-        for b in (self.btn_rev_pending, self.btn_rev_labeled, getattr(self, "btn_rev_hard", None)):
+        if hasattr(self, "btn_rev_line"):
+            self.btn_rev_line.setObjectName("primaryBtn" if self._review_mode == "line" else "")
+        titles = {
+            "pending": "待审预览（点击选择）",
+            "labeled": "已标注（点选后可改标/退回）",
+            "hard": "难例（低置信/改标/金标失败）",
+            "line": "行待审（填整串文字后确认）",
+        }
+        self.gallery_title.setText(titles.get(self._review_mode, "预览"))
+        for b in (
+            self.btn_rev_pending,
+            self.btn_rev_labeled,
+            getattr(self, "btn_rev_hard", None),
+            getattr(self, "btn_rev_line", None),
+        ):
             if b is None:
                 continue
             b.style().unpolish(b)
             b.style().polish(b)
+        self._sync_line_review_ui()
         self._reload_review_lists()
+
+    def _sync_line_review_ui(self) -> None:
+        is_line = self._review_mode == "line"
+        if hasattr(self, "line_label_edit"):
+            self.line_label_edit.setVisible(is_line)
+            self.btn_line_confirm.setVisible(is_line)
+        if hasattr(self, "btn_confirm"):
+            self.btn_confirm.setVisible(not is_line)
+        # 行待审时隐藏逐字按钮区的使用引导，仍可保留按钮但不强制
+        for b in getattr(self, "_digit_btns", {}).values():
+            b.setEnabled(not is_line)
+        for b in getattr(self, "_unit_btns", {}).values():
+            b.setEnabled(not is_line)
 
     def _reload_review_lists(self) -> None:
         if not self.project:
@@ -1665,6 +1873,7 @@ class MainWindow(QMainWindow):
             )
         self._labeled = list_all_labeled(self.project)
         self._hard = list_hard_files(self.project)
+        self._line_pending = list_line_pending(self.project)
         self._rebuild_gallery()
         self._show_current()
         self._update_header()
@@ -1672,6 +1881,78 @@ class MainWindow(QMainWindow):
 
     def _reload_pending(self) -> None:
         self._reload_review_lists()
+
+    def _clear_review_gallery(self) -> None:
+        """清空审核页当前列表：待审或难例。"""
+        proj = self._require_project()
+        if not proj:
+            return
+        mode = self._review_mode
+        if mode == "labeled":
+            QMessageBox.information(
+                self,
+                "提示",
+                "已标注样本请到 ③ 训练页右侧「样本库」按类删除，或单张点「删除」。\n"
+                "避免误清空整库。",
+            )
+            return
+        if mode == "pending":
+            files = list(proj.pending_files())
+            if not files:
+                QMessageBox.information(self, "提示", "待审列表已空")
+                return
+            reply = QMessageBox.question(
+                self,
+                "清空待审",
+                f"将删除全部 {len(files)} 个待审单字，不可恢复。\n已标注的 dataset 不受影响。\n\n确定清空？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+            for p in files:
+                p.unlink(missing_ok=True)
+            self._pending_scores.clear()
+            self._idx = 0
+            self._status.showMessage(f"已清空待审 {len(files)} 个")
+        elif mode == "hard":
+            files = list_hard_files(proj)
+            if not files:
+                QMessageBox.information(self, "提示", "难例列表已空")
+                return
+            reply = QMessageBox.question(
+                self,
+                "清空难例",
+                f"将删除全部 {len(files)} 个难例文件，不可恢复。确定？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+            for p in files:
+                remove_hard_file(proj, p)
+            self._hard_idx = 0
+            self._status.showMessage(f"已清空难例 {len(files)} 个")
+        elif mode == "line":
+            files = list_line_pending(proj)
+            if not files:
+                QMessageBox.information(self, "提示", "行待审已空")
+                return
+            reply = QMessageBox.question(
+                self,
+                "清空行待审",
+                f"将删除全部 {len(files)} 个行待审图，不可恢复。确定？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+            for p in files:
+                p.unlink(missing_ok=True)
+            self._line_idx = 0
+            self._status.showMessage(f"已清空行待审 {len(files)} 个")
+        self._reload_review_lists()
+        self._refresh_project_info()
 
     def _rebuild_gallery(self) -> None:
         self.pending_list.blockSignals(True)
@@ -1684,6 +1965,8 @@ class MainWindow(QMainWindow):
             for p in self._hard:
                 reason = (meta.get(p.name) or {}).get("reason") or "难例"
                 items.append((p, f"难:{reason}"))
+        elif self._review_mode == "line":
+            items = [(p, "行") for p in self._line_pending]
         else:
             items = [(p, lab) for p, lab in self._labeled]
         for i, (path, lab) in enumerate(items):
@@ -1739,6 +2022,12 @@ class MainWindow(QMainWindow):
             if row >= len(self._hard):
                 return
             self._hard_idx = row
+        elif self._review_mode == "line":
+            if row >= len(self._line_pending):
+                return
+            self._line_idx = row
+            if hasattr(self, "line_label_edit"):
+                self.line_label_edit.clear()
         else:
             if row >= len(self._labeled):
                 return
@@ -1762,6 +2051,11 @@ class MainWindow(QMainWindow):
                 return None
             self._hard_idx = max(0, min(self._hard_idx, len(self._hard) - 1))
             return self._hard[self._hard_idx]
+        if self._review_mode == "line":
+            if not self._line_pending:
+                return None
+            self._line_idx = max(0, min(self._line_idx, len(self._line_pending) - 1))
+            return self._line_pending[self._line_idx]
         if not self._labeled:
             return None
         self._labeled_idx = max(0, min(self._labeled_idx, len(self._labeled) - 1))
@@ -1784,6 +2078,11 @@ class MainWindow(QMainWindow):
             elif self._review_mode == "hard":
                 self.char_view.setText("难例队列为空")
                 self.review_meta.setText("无难例")
+            elif self._review_mode == "line":
+                self.char_view.setText("没有行待审\n① 整行蓝框 →「加入行待审」")
+                self.review_meta.setText("无行待审")
+                if hasattr(self, "line_label_edit"):
+                    self.line_label_edit.clear()
             else:
                 self.char_view.setText("还没有已标注样本")
                 self.review_meta.setText("无已标注")
@@ -1799,6 +2098,8 @@ class MainWindow(QMainWindow):
                 row = self._idx
             elif self._review_mode == "hard":
                 row = self._hard_idx
+            elif self._review_mode == "line":
+                row = self._line_idx
             else:
                 row = self._labeled_idx
             if self.pending_list.currentRow() != row:
@@ -1811,9 +2112,16 @@ class MainWindow(QMainWindow):
         if img is None:
             self.char_view.setText("无法读取")
             return
+        # 行图横向展示更宽
+        max_side = 520 if self._review_mode == "line" else 340
         pix = numpy_to_pixmap(img)
         self.char_view.setPixmap(
-            pix.scaled(340, 340, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.FastTransformation)
+            pix.scaled(
+                max_side,
+                340,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.FastTransformation,
+            )
         )
 
         if self._review_mode == "pending":
@@ -1823,6 +2131,30 @@ class MainWindow(QMainWindow):
             self.review_meta.setText(f"难例 {self._hard_idx + 1} / {len(self._hard)}  ·  {path.name}")
             self._update_prediction(path)
             self.btn_confirm.setText("难例：点数字标注后移入数据集")
+        elif self._review_mode == "line":
+            self.review_meta.setText(
+                f"行待审 {self._line_idx + 1} / {len(self._line_pending)}  ·  {path.name}"
+            )
+            self.pred_label_ui.setText("请填写整串文字后点「确认行标注」")
+            self.pred_label_ui.setStyleSheet("font-size:18px; font-weight:700; color:#059669;")
+            self.btn_confirm.setEnabled(False)
+            if hasattr(self, "line_label_edit"):
+                self.line_label_edit.setFocus()
+                # 可选：用行模型预填
+                if self.project:
+                    line_ckpt = latest_line_checkpoint(self.project)
+                    if line_ckpt and not self.line_label_edit.text().strip():
+                        try:
+                            from game_digit_trainer.predict_line import predict_line_gray
+                            from game_digit_trainer.predict_line import load_line_checkpoint
+
+                            model, classes, _h, max_w = load_line_checkpoint(line_ckpt)
+                            text, _parts, _c = predict_line_gray(model, classes, img, max_w=max_w)
+                            if text:
+                                self.line_label_edit.setText(text)
+                                self.line_label_edit.selectAll()
+                        except Exception:
+                            pass
         else:
             lab = self._current_labeled_class() or "?"
             self.review_meta.setText(
@@ -1833,7 +2165,10 @@ class MainWindow(QMainWindow):
             self.btn_confirm.setEnabled(False)
             self.btn_confirm.setText("已标注模式：点数字即可改标")
             self._highlight_suggested_label(lab)
-        self._update_context_view(path)
+        if self._review_mode != "line":
+            self._update_context_view(path)
+        else:
+            self.context_view.setText("行待审：看大图填整串（如 3920万），不必逐字点")
         self._update_review_progress()
 
     def _update_context_view(self, path: Path) -> None:
@@ -2142,7 +2477,7 @@ class MainWindow(QMainWindow):
         path = self._current_review_path()
         if not path:
             return
-        if self._review_mode in ("labeled", "hard"):
+        if self._review_mode in ("labeled", "hard", "line"):
             reply = QMessageBox.question(
                 self,
                 "确认删除",
@@ -2157,6 +2492,13 @@ class MainWindow(QMainWindow):
             self._hard = list_hard_files(self.project)
             if self._hard_idx >= len(self._hard) and self._hard:
                 self._hard_idx = len(self._hard) - 1
+        elif self._review_mode == "line":
+            path.unlink(missing_ok=True)
+            self._line_pending = [p for p in self._line_pending if p != path]
+            if self._line_idx >= len(self._line_pending) and self._line_pending:
+                self._line_idx = len(self._line_pending) - 1
+            if hasattr(self, "line_label_edit"):
+                self.line_label_edit.clear()
         else:
             path.unlink(missing_ok=True)
             if self._review_mode == "pending":
@@ -2181,6 +2523,12 @@ class MainWindow(QMainWindow):
             if self._hard:
                 self._hard_idx = min(self._hard_idx + 1, len(self._hard) - 1)
                 self._show_current()
+        elif self._review_mode == "line":
+            if self._line_pending:
+                self._line_idx = min(self._line_idx + 1, len(self._line_pending) - 1)
+                if hasattr(self, "line_label_edit"):
+                    self.line_label_edit.clear()
+                self._show_current()
         elif self._labeled:
             self._labeled_idx = min(self._labeled_idx + 1, len(self._labeled) - 1)
             self._show_current()
@@ -2194,35 +2542,84 @@ class MainWindow(QMainWindow):
             if self._hard:
                 self._hard_idx = max(self._hard_idx - 1, 0)
                 self._show_current()
+        elif self._review_mode == "line":
+            if self._line_pending:
+                self._line_idx = max(self._line_idx - 1, 0)
+                if hasattr(self, "line_label_edit"):
+                    self.line_label_edit.clear()
+                self._show_current()
         elif self._labeled:
             self._labeled_idx = max(self._labeled_idx - 1, 0)
             self._show_current()
 
     # ---------- dataset ----------
+    def _ds_is_line_mode(self) -> bool:
+        item = self.ds_class_list.currentItem()
+        if not item:
+            return False
+        return item.data(Qt.ItemDataRole.UserRole) == LINE_DATASET_KEY
+
+    def _set_ds_line_controls(self, line_mode: bool) -> None:
+        self.ds_line_edit.setVisible(line_mode)
+        self.btn_ds_line_relabel.setVisible(line_mode)
+        self.ds_move_combo.setVisible(not line_mode)
+        self.btn_ds_move.setVisible(not line_mode)
+        if not line_mode:
+            self.ds_line_edit.clear()
+
     def _reload_dataset_browser(self) -> None:
+        prev_key = None
+        cur = self.ds_class_list.currentItem()
+        if cur:
+            prev_key = cur.data(Qt.ItemDataRole.UserRole)
         self.ds_class_list.clear()
         self.ds_file_list.clear()
         self.ds_move_combo.clear()
         self.ds_preview.setText("选样本")
+        self._set_ds_line_controls(False)
         if not self.project:
             return
+        line_n = count_line_labeled(self.project)
+        line_item = QListWidgetItem(f"【行样本】 ({line_n})")
+        line_item.setData(Qt.ItemDataRole.UserRole, LINE_DATASET_KEY)
+        line_item.setToolTip("审核「行待审」确认后的整行图 + 金标，供训练行模型")
+        self.ds_class_list.addItem(line_item)
         counts = self.project.class_counts()
         for name in self.project.config.classes:
             item = QListWidgetItem(f"{display_label(name)} ({counts.get(name, 0)})")
             item.setData(Qt.ItemDataRole.UserRole, name)
             self.ds_class_list.addItem(item)
             self.ds_move_combo.addItem(display_label(name), name)
-        if self.ds_class_list.count():
-            self.ds_class_list.setCurrentRow(0)
+        # 尽量保持上次选中；有行样本时默认点开行样本便于管理
+        target_row = 0
+        if prev_key is not None:
+            for i in range(self.ds_class_list.count()):
+                if self.ds_class_list.item(i).data(Qt.ItemDataRole.UserRole) == prev_key:
+                    target_row = i
+                    break
+        elif line_n == 0 and self.ds_class_list.count() > 1:
+            target_row = 1
+        self.ds_class_list.setCurrentRow(target_row)
 
     def _on_ds_class(self, _text: str) -> None:
         self.ds_file_list.clear()
+        self.ds_preview.setText("选样本")
         if not self.project:
             return
         item = self.ds_class_list.currentItem()
         if not item:
             return
         label = item.data(Qt.ItemDataRole.UserRole)
+        if label == LINE_DATASET_KEY:
+            self._set_ds_line_controls(True)
+            for path, text in list_line_labeled(self.project):
+                title = f"{text or '（无金标）'}  ·  {path.name}"
+                it = QListWidgetItem(title)
+                it.setData(Qt.ItemDataRole.UserRole, str(path))
+                it.setData(Qt.ItemDataRole.UserRole + 1, text)
+                self.ds_file_list.addItem(it)
+            return
+        self._set_ds_line_controls(False)
         for p in list_dataset_files(self.project, label):
             it = QListWidgetItem(p.name)
             it.setData(Qt.ItemDataRole.UserRole, str(p))
@@ -2238,11 +2635,19 @@ class MainWindow(QMainWindow):
         if img is None:
             self.ds_preview.setText("无法读取")
             return
+        max_w, max_h = (280, 120) if self._ds_is_line_mode() else (120, 120)
         self.ds_preview.setPixmap(
             numpy_to_pixmap(img).scaled(
-                120, 120, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.FastTransformation
+                max_w,
+                max_h,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.FastTransformation,
             )
         )
+        if self._ds_is_line_mode():
+            text = item.data(Qt.ItemDataRole.UserRole + 1) or ""
+            self.ds_line_edit.setText(str(text))
+            self.ds_line_edit.setFocus()
 
     def _current_ds_path(self) -> Path | None:
         item = self.ds_file_list.currentItem()
@@ -2250,7 +2655,31 @@ class MainWindow(QMainWindow):
             return None
         return Path(item.data(Qt.ItemDataRole.UserRole))
 
+    def _ds_update_line_label(self) -> None:
+        proj = self._require_project()
+        path = self._current_ds_path()
+        if not proj or not path or not self._ds_is_line_mode():
+            return
+        text = (self.ds_line_edit.text() or "").strip()
+        if not text:
+            QMessageBox.information(self, "提示", "请填写金标，例如 3920万")
+            return
+        try:
+            display = update_line_label(proj, path, text)
+        except Exception as exc:
+            QMessageBox.warning(self, "改金标失败", str(exc))
+            return
+        row = self.ds_file_list.currentRow()
+        self._on_ds_class("")
+        if 0 <= row < self.ds_file_list.count():
+            self.ds_file_list.setCurrentRow(row)
+        self._refresh_project_info()
+        self._status.showMessage(f"行金标已改为：{display}")
+
     def _ds_move(self) -> None:
+        if self._ds_is_line_mode():
+            self._ds_update_line_label()
+            return
         proj = self._require_project()
         path = self._current_ds_path()
         if not proj or not path:
@@ -2265,6 +2694,7 @@ class MainWindow(QMainWindow):
         self._refresh_project_info()
 
     def _ds_delete(self) -> None:
+        proj = self._require_project()
         path = self._current_ds_path()
         if not path:
             return
@@ -2277,9 +2707,65 @@ class MainWindow(QMainWindow):
         )
         if reply != QMessageBox.StandardButton.Yes:
             return
-        path.unlink(missing_ok=True)
+        if self._ds_is_line_mode() and proj:
+            delete_line_sample(proj, path)
+        else:
+            path.unlink(missing_ok=True)
+        self._on_ds_class("")
+        self._refresh_project_info()
+        # 刷新左侧计数
+        self._reload_dataset_browser()
+
+    def _ds_clear_class(self) -> None:
+        proj = self._require_project()
+        if not proj:
+            return
+        item = self.ds_class_list.currentItem()
+        if not item:
+            QMessageBox.information(self, "提示", "请先在左侧选中一个类别")
+            return
+        name = item.data(Qt.ItemDataRole.UserRole)
+        if name == LINE_DATASET_KEY:
+            n = count_line_labeled(proj)
+            if n <= 0:
+                QMessageBox.information(self, "提示", "没有已标行样本")
+                return
+            reply = QMessageBox.question(
+                self,
+                "清空行样本",
+                f"将删除全部 {n} 个已标行样本及金标，不可恢复。确定？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+            deleted = clear_line_samples(proj)
+            self._reload_dataset_browser()
+            self._refresh_project_info()
+            self._status.showMessage(f"已清空行样本 {deleted} 个")
+            return
+        try:
+            name = normalize_label(str(name))
+        except Exception:
+            name = str(name)
+        files = list_dataset_files(proj, name)
+        if not files:
+            QMessageBox.information(self, "提示", f"类别「{display_label(name)}」已无样本")
+            return
+        reply = QMessageBox.question(
+            self,
+            "清空本类",
+            f"将删除类别「{display_label(name)}」下全部 {len(files)} 个样本，不可恢复。确定？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        for p in files:
+            p.unlink(missing_ok=True)
         self._reload_dataset_browser()
         self._refresh_project_info()
+        self._status.showMessage(f"已清空类别 {display_label(name)}（{len(files)}）")
 
     # ---------- train / export ----------
     def _start_train(self) -> None:
@@ -2315,6 +2801,68 @@ class MainWindow(QMainWindow):
         self._worker.done.connect(self._train_done)
         self._worker.failed.connect(lambda e: QMessageBox.critical(self, "训练失败", e))
         self._worker.start()
+
+    def _start_train_line(self) -> None:
+        proj = self._require_project()
+        if not proj:
+            return
+        if self._worker and self._worker.isRunning():
+            QMessageBox.information(self, "提示", "训练进行中")
+            return
+        from game_digit_trainer.line_data import count_line_labeled, load_char_pools
+
+        line_n = count_line_labeled(proj)
+        char_n = sum(proj.class_counts().values())
+        has_pools = bool(load_char_pools(proj))
+        if line_n <= 0 and not has_pools:
+            QMessageBox.warning(
+                self,
+                "提示",
+                "还没有行样本，也无法用单字合成。\n"
+                "请先：① 整行蓝框 →「加入行待审」→ ② 填金标确认，再点「训练行模型」。",
+            )
+            return
+        if line_n <= 0 and char_n < 10:
+            QMessageBox.warning(
+                self,
+                "提示",
+                f"没有行样本，且单字太少（{char_n}）。\n"
+                "推荐直接标几条「行样本」再训；或先多标一些单字用于合成。",
+            )
+            return
+        self.train_log.clear()
+        if line_n and not has_pools:
+            self.train_log.append(
+                f"仅用真实行样本训练（{line_n} 条，会增强/重复采样）。"
+                "无需单字库。样本越多越准；识别仍是蓝框一次前向。"
+            )
+        elif line_n and has_pools:
+            self.train_log.append(
+                f"真实行 {line_n} 条 + 单字合成行图。训练可能较久；识别很快。"
+            )
+        else:
+            self.train_log.append(
+                "当前无真实行样本，将用单字拼成行图训练（精度通常不如真实 HUD）。"
+                "建议之后多标行样本再训。"
+            )
+        # 精度优先：至少 20 轮，尊重用户调高的轮数
+        epochs = max(20, int(self.epochs_spin.value()))
+        self._worker = TrainWorker(proj, epochs, augment=False, line_mode=True)
+        self._worker.log.connect(lambda m: self.train_log.append(m))
+        self._worker.done.connect(self._train_line_done)
+        self._worker.failed.connect(lambda e: QMessageBox.critical(self, "行模型训练失败", e))
+        self._worker.start()
+
+    def _train_line_done(self, path: str) -> None:
+        self.train_log.append(f"行模型完成: {path}")
+        self._refresh_project_info()
+        self._reload_verify_models()
+        QMessageBox.information(
+            self,
+            "行模型完成",
+            f"已保存：{path}\n\n切字页用「整行蓝框」圈数字后点「预览识别」即可出整串（不切字）。",
+        )
+        self._status.showMessage(f"行模型完成: {path}")
 
     def _train_done(self, path: str) -> None:
         self.train_log.append(f"完成: {path}")
@@ -2523,28 +3071,41 @@ class MainWindow(QMainWindow):
         proj = self._require_project()
         if not proj:
             return
-        ckpt = latest_checkpoint(proj)
-        if not ckpt:
-            if not silent:
-                QMessageBox.information(self, "提示", "请先训练模型再预览识别")
-            if hasattr(self, "preview_big"):
-                self.preview_big.setText("识别预览：需先训练")
-            return
         if not self._current_import:
             if not silent:
                 QMessageBox.information(self, "提示", "请先打开一张截图")
             return
-        boxes = self.import_canvas.boxes()
-        if not boxes:
+        # 优先行模型（蓝框/宽区域 → 整串，不切字）
+        if self._try_line_recognize(silent=silent):
+            return
+        ckpt = latest_checkpoint(proj)
+        if not ckpt:
             if not silent:
-                self._auto_preview_boxes()
-                boxes = self.import_canvas.boxes()
-        if not boxes:
-            if not silent:
-                QMessageBox.warning(self, "提示", "请先框出字框")
+                QMessageBox.information(
+                    self,
+                    "提示",
+                    "还没有行模型 / 单字模型。\n"
+                    "推荐：③ 训练页点「训练行模型」；或先训单字再用切字识别。",
+                )
+            if hasattr(self, "preview_big"):
+                self.preview_big.setText("识别预览：需先训练行模型或单字模型")
             return
         try:
             bgr = load_bgr(self._current_import)
+            boxes = self._prepare_recognize_boxes(bgr)
+        except Exception as exc:
+            if not silent:
+                QMessageBox.critical(self, "预览失败", str(exc))
+            return
+        if not boxes:
+            if not silent:
+                QMessageBox.warning(
+                    self,
+                    "提示",
+                    "无行模型且切字为空。请先「训练行模型」，或用蓝框圈紧后再试。",
+                )
+            return
+        try:
             text, parts = predict_boxes_string(
                 proj,
                 bgr,
@@ -2560,9 +3121,134 @@ class MainWindow(QMainWindow):
         if hasattr(self, "preview_big"):
             self.preview_big.setText(text or "（空）")
         detail = " ".join(f"{display_label(l)}({c:.0%})" for l, c in parts)
-        self.trial_result.setText(f"预览明细：{detail}")
+        self.trial_result.setText(f"预览明细（单字路径）：{detail}")
         if not silent:
             self._status.showMessage(f"识别预览：{text}")
+
+    def _region_for_line(self) -> tuple[int, int, int, int] | None:
+        """行识别区域：优先蓝框，否则单个宽绿框。"""
+        from game_digit_trainer.segment import looks_like_region_box
+
+        roi = self.import_canvas.roi()
+        if roi:
+            return tuple(int(v) for v in roi)  # type: ignore[return-value]
+        boxes = list(self.import_canvas.boxes())
+        if len(boxes) == 1 and looks_like_region_box(boxes[0]):
+            return boxes[0]
+        return None
+
+    def _try_line_recognize(self, *, silent: bool = False) -> bool:
+        proj = self.project
+        if not proj or not self._current_import:
+            return False
+        line_ckpt = latest_line_checkpoint(proj)
+        if not line_ckpt:
+            return False
+        region = self._region_for_line()
+        if region is None:
+            return False
+        try:
+            bgr = load_bgr(self._current_import)
+            text, parts, mean_conf = predict_line_roi(proj, bgr, region, line_ckpt)
+        except Exception as exc:
+            if not silent:
+                QMessageBox.critical(self, "行识别失败", str(exc))
+            return True
+        if hasattr(self, "preview_big"):
+            self.preview_big.setText(text or "（空）")
+        detail = " ".join(f"{display_label(l)}({c:.0%})" for l, c in parts) or f"mean={mean_conf:.0%}"
+        self.trial_result.setText(f"行模型明细：{detail}")
+        self.import_canvas.set_predictions([])
+        if not silent:
+            self._status.showMessage(f"行识别：{text} ← {line_ckpt.parent.name}/line_best.pt")
+        return True
+
+    def _save_line_sample(self) -> None:
+        proj = self._require_project()
+        if not proj:
+            return
+        if not self._current_import:
+            QMessageBox.information(self, "提示", "请先打开截图")
+            return
+        text = (self.gold_edit.text() or "").strip()
+        if not text:
+            QMessageBox.information(self, "提示", "请先填写金标，例如 3920万")
+            return
+        try:
+            bgr = load_bgr(self._current_import)
+            region = self._region_for_line()
+            path = save_line_sample(proj, bgr, region, text)
+        except Exception as exc:
+            QMessageBox.warning(self, "保存失败", str(exc))
+            return
+        self._status.showMessage(f"已存行样本：{path.name}（金标 {text}）")
+        QMessageBox.information(self, "已保存", f"行样本：{path}\n金标：{text}\n可在 ③ 再点「训练行模型」")
+
+    def _add_line_pending(self) -> None:
+        """蓝框圈选后加入行待审（先不填字）。"""
+        proj = self._require_project()
+        if not proj:
+            return
+        if not self._current_import:
+            QMessageBox.information(self, "提示", "请先打开或截取一张图")
+            return
+        region = self._region_for_line()
+        if region is None:
+            QMessageBox.information(
+                self,
+                "提示",
+                "请先点「整行蓝框」，拖出蓝框圈住一整行数字，再点「加入行待审」。",
+            )
+            return
+        try:
+            bgr = load_bgr(self._current_import)
+            path = save_line_pending(
+                proj, bgr, region, source_name=self._current_import.name
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "加入失败", str(exc))
+            return
+        self._update_header()
+        self._status.showMessage(f"已加入行待审：{path.name}")
+        reply = QMessageBox.question(
+            self,
+            "已加入行待审",
+            f"已保存：{path.name}\n\n现在去 ②「行待审」填写整串文字吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self.tabs.setCurrentIndex(self.TAB_REVIEW)
+            self._set_review_mode("line")
+
+    def _confirm_line_pending(self) -> None:
+        proj = self._require_project()
+        if not proj or self._review_mode != "line":
+            return
+        path = self._current_review_path()
+        if not path:
+            return
+        text = (self.line_label_edit.text() or "").strip()
+        if not text:
+            QMessageBox.information(self, "提示", "请填写整串文字，例如 3920万")
+            return
+        try:
+            dest = confirm_line_pending(proj, path, text)
+        except Exception as exc:
+            QMessageBox.warning(self, "标注失败", str(exc))
+            return
+        self.line_label_edit.clear()
+        self._line_pending = list_line_pending(proj)
+        if self._line_idx >= len(self._line_pending) and self._line_pending:
+            self._line_idx = len(self._line_pending) - 1
+        self._rebuild_gallery()
+        self._show_current(sync_list=True)
+        self._update_header()
+        self._refresh_project_info()
+        self._status.showMessage(f"行已标注：{text} → {dest.name}")
+        # 方便立刻去样本库核对
+        if self.tabs.currentIndex() == self.TAB_TRAIN:
+            self._reload_dataset_browser()
 
     def _set_canvas_interaction(self, mode: str) -> None:
         self.import_canvas.set_interaction_mode(mode)
@@ -3093,6 +3779,10 @@ class MainWindow(QMainWindow):
             else "高级选项 ▾（ROI 预设 / 缩放 / 定时刷样…）"
         )
         update_prefs(work_more_open=checked)
+        if checked and hasattr(self, "work_scroll"):
+            # 展开后内容变长，滚到高级区方便操作
+            QTimer.singleShot(0, lambda: self.work_scroll.ensureWidgetVisible(self.btn_more))
+
 
     def _recent_onnx_paths(self) -> list[str]:
         raw = self._ui_prefs.get("recent_onnx_models") or []
@@ -3193,30 +3883,59 @@ class MainWindow(QMainWindow):
                 QMessageBox.information(
                     self,
                     "提示",
-                    "请先在「验模型」下拉中选择模型，或点「浏览 ONNX…」加载其它电脑导出的包。",
+                    "请先在「验模型」下拉中选择模型，或点「浏览 ONNX…」加载外部包。",
                 )
             return
+        if not self._current_import:
+            if not silent:
+                QMessageBox.information(self, "提示", "请先打开或截取一张图")
+            return
+
+        if model.kind == "line":
+            region = self._region_for_line()
+            if region is None:
+                if not silent:
+                    QMessageBox.warning(self, "提示", "行模型请先用「整行蓝框」圈住数字行")
+                return
+            try:
+                bgr = load_bgr(self._current_import)
+                text, parts, mean_conf = predict_line_roi(proj, bgr, region, model.path)
+            except Exception as exc:
+                if not silent:
+                    QMessageBox.critical(self, "行识别失败", str(exc))
+                return
+            self.import_canvas.set_predictions([])
+            if hasattr(self, "preview_big"):
+                self.preview_big.setText(text or "（空）")
+            detail = " ".join(f"{display_label(l)}({c:.0%})" for l, c in parts) or f"mean={mean_conf:.0%}"
+            self.trial_result.setText(f"行模型明细（{model.display}）：{detail}")
+            update_prefs(last_verify_model=model.key())
+            if not silent:
+                self._status.showMessage(f"行识别：{text} ← {model.display}")
+            return
+
         if model.kind == "onnx":
             ok, msg = check_onnxruntime_dependency()
             if not ok:
                 if not silent:
                     QMessageBox.warning(self, "无法运行 ONNX", msg)
                 return
-        if not self._current_import:
-            if not silent:
-                QMessageBox.information(self, "提示", "请先打开或截取一张图")
-            return
-        boxes = self.import_canvas.boxes()
-        if not boxes:
-            if not silent:
-                self._auto_preview_boxes()
-                boxes = self.import_canvas.boxes()
-        if not boxes:
-            if not silent:
-                QMessageBox.warning(self, "提示", "请先框出字框或蓝 ROI")
-            return
         try:
             bgr = load_bgr(self._current_import)
+            boxes = self._prepare_recognize_boxes(bgr)
+        except Exception as exc:
+            if not silent:
+                QMessageBox.critical(self, "识别失败", str(exc))
+            return
+        if not boxes:
+            if not silent:
+                QMessageBox.warning(
+                    self,
+                    "提示",
+                    "区域内没有切出字。请用「整行蓝框」圈紧数字，或调节「间距」后再试。",
+                )
+            return
+        try:
             conf = float(self.conf_spin.value()) if hasattr(self, "conf_spin") else 0.5
             text, parts = predict_boxes_with_model(
                 proj, bgr, boxes, model, conf_threshold=conf
@@ -3253,7 +3972,10 @@ class MainWindow(QMainWindow):
         if self.tabs.currentIndex() == self.TAB_WORK:
             self._segment_current()
         elif self.tabs.currentIndex() == self.TAB_REVIEW:
-            self._confirm_prediction()
+            if self._review_mode == "line":
+                self._confirm_line_pending()
+            else:
+                self._confirm_prediction()
 
     def _highlight_suggested_label(self, label: str | None) -> None:
         for b in self._digit_btns.values():

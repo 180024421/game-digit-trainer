@@ -4,7 +4,7 @@ from __future__ import annotations
 DIGIT_CLASSES: list[str] = [str(i) for i in range(10)]
 
 # Optional punctuation
-SYMBOL_CLASS_NAMES: list[str] = ["comma", "slash", "percent", "colon"]
+SYMBOL_CLASS_NAMES: list[str] = ["dot", "comma", "slash", "percent", "colon"]
 
 # Optional Chinese magnitude units (game HUD: 1.2万 / 3亿)
 UNIT_CLASS_NAMES: list[str] = ["wan", "yi"]
@@ -14,6 +14,8 @@ DEFAULT_CLASSES: list[str] = DIGIT_CLASSES + SYMBOL_CLASS_NAMES + UNIT_CLASS_NAM
 
 # Raw / display char -> folder class name
 SYMBOL_CLASSES: dict[str, str] = {
+    ".": "dot",
+    "·": "dot",  # middle dot sometimes used in HUDs
     ",": "comma",
     "/": "slash",
     "%": "percent",
@@ -28,6 +30,7 @@ SYMBOL_CLASSES: dict[str, str] = {
 }
 
 DISPLAY_FOR_CLASS: dict[str, str] = {
+    "dot": ".",
     "comma": ",",
     "slash": "/",
     "percent": "%",

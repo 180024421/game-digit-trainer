@@ -67,6 +67,7 @@ class GameProject:
         self.config_path = self.root / "config.json"
         self.raw_dir = self.root / "images" / "raw"
         self.roi_dir = self.root / "images" / "roi"
+        self.lines_dir = self.root / "lines"
         self.dataset_dir = self.root / "dataset"
         self.pending_dir = self.root / "pending"
         self.runs_dir = self.root / "runs"
@@ -83,6 +84,7 @@ class GameProject:
         for d in (
             self.raw_dir,
             self.roi_dir,
+            self.lines_dir,
             self.dataset_dir,
             self.pending_dir,
             self.runs_dir,
@@ -154,9 +156,14 @@ def create_project(
 
 def ensure_unit_classes(project: GameProject) -> list[str]:
     """为已有项目追加 万/亿 类别（若尚未包含）。返回新加入的类名。"""
+    return ensure_classes(project, UNIT_CLASS_NAMES)
+
+
+def ensure_classes(project: GameProject, names: list[str]) -> list[str]:
+    """为已有项目追加类别（若尚未包含）。返回新加入的类名。"""
     added: list[str] = []
     cfg = project.config
-    for name in UNIT_CLASS_NAMES:
+    for name in names:
         if name not in cfg.classes:
             cfg.classes.append(name)
             added.append(name)
@@ -164,6 +171,11 @@ def ensure_unit_classes(project: GameProject) -> list[str]:
         project.save_config()
         project.ensure_dirs()
     return added
+
+
+def ensure_dot_class(project: GameProject) -> list[str]:
+    """为已有项目追加小数点类别。"""
+    return ensure_classes(project, ["dot"])
 
 
 def open_project(path: Path) -> GameProject:

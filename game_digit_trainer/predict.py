@@ -151,9 +151,9 @@ def check_onnxruntime_dependency() -> tuple[bool, str]:
 
 @dataclass(frozen=True)
 class ModelRef:
-    """可选推理模型：导出 ONNX 包或 PyTorch checkpoint。"""
+    """可选推理模型：导出 ONNX 包或 PyTorch checkpoint / 行模型。"""
 
-    kind: str  # "onnx" | "pt"
+    kind: str  # "onnx" | "pt" | "line"
     path: Path
     labels_path: Path | None = None
     manifest_path: Path | None = None
@@ -222,6 +222,19 @@ def list_project_models(
                 except ValueError:
                     continue
         if project.runs_dir.is_dir():
+            lines = sorted(
+                project.runs_dir.glob("*/line_best.pt"),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )[:max_pt]
+            for pt in lines:
+                _add(
+                    ModelRef(
+                        kind="line",
+                        path=pt,
+                        display=f"[行] {pt.parent.name}/line_best.pt",
+                    )
+                )
             bests = sorted(
                 project.runs_dir.glob("*/best.pt"),
                 key=lambda p: p.stat().st_mtime,

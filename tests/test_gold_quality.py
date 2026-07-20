@@ -3,8 +3,9 @@ from game_digit_trainer.quality import min_samples_gate
 
 
 def test_tokenize_expected():
-    classes = [str(i) for i in range(10)] + ["wan", "colon"]
+    classes = [str(i) for i in range(10)] + ["dot", "wan", "colon"]
     assert tokenize_expected("12万", classes) == ["1", "2", "wan"]
+    assert tokenize_expected("1.2万", classes) == ["1", "dot", "2", "wan"]
     assert tokenize_expected("2:03", classes) == ["2", "colon", "0", "3"]
 
 

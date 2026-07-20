@@ -101,6 +101,68 @@ def crop_bgr(bgr: np.ndarray, roi: tuple[int, int, int, int] | None) -> np.ndarr
     return bgr[y0:y1, x0:x1].copy()
 
 
+Box = tuple[int, int, int, int]
+
+
+def looks_like_region_box(box: Box, *, min_aspect: float = 1.8, min_width: int = 40) -> bool:
+    """很宽的框更像整行区域，而不是单个数字。"""
+    _x, _y, w, h = box
+    if w < min_width:
+        return False
+    return w / max(h, 1) >= min_aspect
+
+
+def boxes_from_region(
+    bgr: np.ndarray,
+    region: Box | None,
+    preprocess: PreprocessConfig,
+    *,
+    max_gap: int = 3,
+) -> list[Box]:
+    """在 ROI（或整图）内自动切字，返回全图坐标绿框。"""
+    from game_digit_trainer.box_ops import auto_fix_boxes
+
+    sliced = crop_bgr(bgr, region)
+    binary = apply_preprocess(sliced, preprocess)
+    crops = segment_binary(binary, max_gap=max_gap)
+    ox = region[0] if region else 0
+    oy = region[1] if region else 0
+    boxes = [(c.x + ox, c.y + oy, c.w, c.h) for c in crops]
+    fixed, _tips = auto_fix_boxes(boxes)
+    return fixed
+
+
+def resolve_recognize_boxes(
+    bgr: np.ndarray,
+    *,
+    preprocess: PreprocessConfig,
+    roi: Box | None,
+    boxes: list[Box],
+    max_gap: int = 3,
+) -> tuple[list[Box], str]:
+    """
+    识别用字框解析（训练仍用手切单字；识别可框一块区域）。
+
+    返回 (boxes, mode)：mode 为 manual | roi | wide_box | single | full。
+    """
+    char_boxes = [b for b in boxes if not looks_like_region_box(b)]
+    if len(char_boxes) >= 2:
+        ordered = sorted(char_boxes, key=lambda b: (b[0], b[1]))
+        return ordered, "manual"
+
+    if roi is not None:
+        return boxes_from_region(bgr, roi, preprocess, max_gap=max_gap), "roi"
+
+    if len(boxes) == 1 and looks_like_region_box(boxes[0]):
+        return boxes_from_region(bgr, boxes[0], preprocess, max_gap=max_gap), "wide_box"
+
+    if len(boxes) == 1:
+        return list(boxes), "single"
+
+    # 无框：整图尝试（HUD 截图本身往往已是一行）
+    return boxes_from_region(bgr, None, preprocess, max_gap=max_gap), "full"
+
+
 def crops_from_full_boxes(
     bgr: np.ndarray,
     boxes: list[tuple[int, int, int, int]],
@@ -166,12 +228,14 @@ def save_pending_chars(
 
 
 def move_to_label(project: GameProject, pending: Path, label: str) -> Path:
-    from game_digit_trainer.labels import normalize_label
+    from game_digit_trainer.labels import display_label, normalize_label
     from game_digit_trainer.sample_meta import rename_meta_key
 
     name = normalize_label(label)
     if name not in project.config.classes:
-        raise ValueError(f"项目未启用类别: {name}")
+        shown = display_label(name)
+        hint = "，请点顶部「+小数点」" if name == "dot" else ""
+        raise ValueError(f"项目未启用类别「{shown}」{hint}")
     dest_dir = project.dataset_dir / name
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest = dest_dir / pending.name
@@ -225,12 +289,14 @@ def list_all_labeled(project: GameProject) -> list[tuple[Path, str]]:
 
 
 def relabel_dataset_file(project: GameProject, path: Path, new_label: str) -> Path:
-    from game_digit_trainer.labels import normalize_label
+    from game_digit_trainer.labels import display_label, normalize_label
     from game_digit_trainer.sample_meta import rename_meta_key
 
     name = normalize_label(new_label)
     if name not in project.config.classes:
-        raise ValueError(f"项目未启用类别: {name}")
+        shown = display_label(name)
+        hint = "，请点顶部「+小数点」" if name == "dot" else ""
+        raise ValueError(f"项目未启用类别「{shown}」{hint}")
     # 同目录同标签：无需移动
     if path.parent.name == name and path.is_file():
         return path

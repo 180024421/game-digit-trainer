@@ -8,9 +8,10 @@ TEMPLATES: dict[str, dict] = {
         "units": False,
     },
     "coins": {
-        "label": "金币（数字+万/亿）",
+        "label": "金币（数字+小数点+万/亿）",
         "symbols": False,
         "units": True,
+        "force_classes": [str(i) for i in range(10)] + ["dot", "wan", "yi"],
     },
     "hp_percent": {
         "label": "血量百分比（数字+%）",
