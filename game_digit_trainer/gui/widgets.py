@@ -4,7 +4,7 @@ from PyQt6.QtCore import QPoint, QPointF, QRect, QSize, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QCursor, QImage, QPainter, QPen, QPixmap, QWheelEvent
 from PyQt6.QtWidgets import QLabel, QSizePolicy
 
-from game_digit_trainer.box_ops import merge_neighbor_boxes, merge_tiny_boxes
+from game_digit_trainer.box_ops import is_oversized_box, merge_neighbor_boxes, merge_tiny_boxes
 
 # hit zones for resize
 _HANDLE = ("move", "nw", "n", "ne", "e", "se", "s", "sw", "w")
@@ -441,13 +441,15 @@ class ImageCanvas(QLabel):
         return max(4, min(24, int(10 / max(self._scale, 0.05))))
 
     def _hit_box(self, img_pt: QPoint) -> tuple[int, str] | None:
-        """返回 (index, kind)。手柄按屏幕像素判定，框内按图像坐标。"""
-        # 先用屏幕坐标测手柄，放大后也好点
+        """返回 (index, kind)。手柄按屏幕像素判定；小框可点内部；巨框仅边框/手柄可选中。"""
         widget_pt = self._image_to_widget(img_pt.x(), img_pt.y())
         hs = 10
+        border_px = 12
         order = list(range(len(self._boxes)))
         if 0 <= self._selected_box < len(self._boxes):
             order = [self._selected_box] + [i for i in order if i != self._selected_box]
+
+        # 1) 手柄优先（任意大小）
         for i in order:
             x, y, w, h = self._boxes[i]
             p0 = self._image_to_widget(x, y)
@@ -466,10 +468,34 @@ class ImageCanvas(QLabel):
             for kind, pt in pts.items():
                 if abs(widget_pt.x() - pt.x()) <= hs and abs(widget_pt.y() - pt.y()) <= hs:
                     return i, kind
-            # 框体：图像坐标
-            if x <= img_pt.x() <= x + w and y <= img_pt.y() <= y + h:
-                return i, "move"
-        return None
+
+        # 2) 框体：重叠时优先更小的框；巨框只认靠近边框的点击
+        body_hits: list[tuple[int, int, str]] = []  # area, index, kind
+        iw = self._src.width() if self._src else 0
+        ih = self._src.height() if self._src else 0
+        for i in order:
+            x, y, w, h = self._boxes[i]
+            if not (x <= img_pt.x() <= x + w and y <= img_pt.y() <= y + h):
+                continue
+            p0 = self._image_to_widget(x, y)
+            p1 = self._image_to_widget(x + w, y + h)
+            rect = QRect(p0, p1).normalized()
+            oversized = is_oversized_box((x, y, w, h), iw, ih)
+            if oversized:
+                near_border = (
+                    abs(widget_pt.x() - rect.left()) <= border_px
+                    or abs(widget_pt.x() - rect.right()) <= border_px
+                    or abs(widget_pt.y() - rect.top()) <= border_px
+                    or abs(widget_pt.y() - rect.bottom()) <= border_px
+                )
+                if not near_border:
+                    continue
+            body_hits.append((w * h, i, "move"))
+        if not body_hits:
+            return None
+        body_hits.sort(key=lambda t: t[0])  # 小框优先
+        _area, idx, kind = body_hits[0]
+        return idx, kind
 
     def _cursor_for_kind(self, kind: str | None) -> Qt.CursorShape:
         mapping = {
@@ -900,6 +926,13 @@ class ImageCanvas(QLabel):
             return
         box = self._clamp_roi(p0.x(), p0.y(), p1.x(), p1.y())
         if not box:
+            self._repaint_canvas()
+            return
+        iw = self._src.width() if self._src else 0
+        ih = self._src.height() if self._src else 0
+        # 逐字模式误拖成整条 HUD：改成蓝框，避免绿巨框盖住后无法再框
+        if self._mode == self.MODE_CHAR and is_oversized_box(box, iw, ih):
+            self.set_roi(box)
             self._repaint_canvas()
             return
         if self._mode == self.MODE_CHAR:

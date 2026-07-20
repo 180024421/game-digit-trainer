@@ -1,6 +1,9 @@
 # game-digit-trainer
 
-游戏 HUD **多字体数字** 训练站：切字 → 审核修正 → 训练小 CNN → 导出 ONNX，供 [auto-script-studio](https://github.com/180024421/auto-script-studio) 后续接入。
+游戏 HUD **多字体数字** 训练站：采标 → 训练 → 导出 ONNX，供 [auto-script-studio](https://github.com/180024421/auto-script-studio) 脚本识别。
+
+**主路径（推荐）**：整行蓝框 → 行待审 → **行模型 CRNN** → 蓝框一次出整串。  
+**兼容路径**：逐字切字 → 单字 CNN → `digits.onnx`（旧 Studio 包）。
 
 > 仅供学习与研究。请遵守游戏服务条款与当地法律法规。
 
@@ -13,13 +16,17 @@ cd E:\xiangmu\game-digit-trainer
 
 首次会自动创建 `.venv` 并安装依赖（含 PyTorch，可能较慢）。也可先运行 `.\安装依赖.cmd`。
 
-## 推荐操作
+## 推荐操作（行模型）
 
-1. 顶部选**模板**后 **新建/打开** 项目  
-2. **① 截图切字**：主路径截图→切字→预览→Enter；**验模型**区可下拉切换 /「浏览 ONNX…」加载其它电脑导出的包后识别；进阶在「高级选项」  
-3. **② 审核**：预标排序 + 同类批量  
-4. **③ 训练导出**：补齐稀缺类 → 训练（自动写混淆矩阵）→ 导出 → **拷到 Studio models/**  
-5. Studio：`bot.recognizeDigits({ roi=... })` 读 HUD 数字（见 `docs/studio-recognize-digits.md`）  
+1. 顶部 **新建/打开** 项目  
+2. **①**：框选截屏 F2 → **整行蓝框** 圈数字 → **加入行待审**（约 30～50 条更好）  
+3. **②「行待审」**：填整串金标确认  
+4. **③**：**训练行模型** → **导出行 ONNX** → **拷行模型到 Studio**  
+5. Studio：`bot.recognizeDigits({ roi=..., model="models/line/digits_line" })`  
+
+换机/备份标注：③ 页 **导出标注包** / **导入标注包**（单字 + 行样本/待审 + 难例；不含模型）。也可「备份项目」打整包。
+
+单字路径仍保留（确认切字 / 训练单字 / 导出单字 ONNX），见 `docs/studio-recognize-digits.md`。
 
 快捷键：`F2` · `Enter` · `Ctrl+Z` / `Ctrl+Y` · 空格拖图/确认  
 
@@ -34,7 +41,9 @@ cd E:\xiangmu\game-digit-trainer
 
 ## 文档
 
-- 设计：`docs/superpowers/specs/2026-07-17-game-digit-trainer-design.md`
+- Studio 接入：`docs/studio-recognize-digits.md`
+- 行模型设计：`docs/superpowers/specs/2026-07-20-line-crnn-design.md`
+- 主设计：`docs/superpowers/specs/2026-07-17-game-digit-trainer-design.md`
 - Agent：`AGENTS.md`
 
 ## 许可

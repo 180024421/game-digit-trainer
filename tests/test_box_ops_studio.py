@@ -2,7 +2,13 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from game_digit_trainer.box_ops import auto_fix_boxes, merge_neighbor_boxes, merge_tiny_boxes
+from game_digit_trainer.box_ops import (
+    auto_fix_boxes,
+    filter_giant_auto_boxes,
+    is_oversized_box,
+    merge_neighbor_boxes,
+    merge_tiny_boxes,
+)
 from game_digit_trainer.studio_pack import LUA_STUB, copy_exports_to_studio
 
 
@@ -25,6 +31,13 @@ def test_autofix():
     fixed, tips = auto_fix_boxes(boxes)
     assert len(fixed) >= 1
     assert tips  # 宽框应被建议拆
+
+
+def test_oversized_and_filter_giant():
+    assert is_oversized_box((0, 0, 900, 40), 1000, 50)
+    assert not is_oversized_box((10, 5, 40, 30), 1000, 50)
+    assert filter_giant_auto_boxes([(0, 0, 950, 45)], 1000, 50) == []
+    assert len(filter_giant_auto_boxes([(10, 5, 40, 30), (60, 5, 40, 30)], 1000, 50)) == 2
 
 
 def test_copy_studio(tmp_path: Path):

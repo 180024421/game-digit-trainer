@@ -15,7 +15,7 @@
 
 - 输入：`1×32×W`（高固定 32，宽按行缩放，训练 pad 到固定 max_w，推理可用实际宽）。
 - 结构：小 CNN → 宽度作时间步 → BiLSTM → `Linear(num_classes+1)`（CTC blank）。
-- Checkpoint：`runs/<ts>/line_best.pt`；导出：`exports/line/digits_line.onnx`（GUI 一期可先 `.pt`）。
+- Checkpoint：`runs/<ts>/line_best.pt`；导出：`exports/line/digits_line.onnx`（已实现 GUI「导出行 ONNX」+ Studio `kind=line_crnn`）。
 
 ## 3. GUI
 
@@ -23,7 +23,7 @@
 - 切字页识别：若有行模型且存在蓝框/宽区域 → **优先行识别**；否则回退单字路径。
 - 金标旁：**「保存为行样本」**（当前图裁蓝框 + 金标写入 `lines/`）。
 
-## 4. 非目标（一期）
+## 4. 非目标（一期已部分放开）
 
-- 不改 auto-script-studio `recognizeDigits`（仍为切字+单字 ONNX）。
+- Studio `recognizeDigits`：**已支持** `manifest.kind=line_crnn`（PC + Android）。
 - 不删除单字训练/导出。

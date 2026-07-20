@@ -65,3 +65,24 @@ def test_line_train_real_only_no_chars(tmp_path):
     assert x.shape[0] == 1 and y.numel() >= 1 and w >= 1
     path = train_line_project(proj, epochs=1, batch_size=2, synthetic=0, log=lambda _m: None)
     assert path.is_file()
+
+
+def test_export_line_onnx(tmp_path):
+    from game_digit_trainer.export_line_onnx import export_line_onnx
+    from game_digit_trainer.predict import check_onnx_dependency
+
+    ok, _ = check_onnx_dependency()
+    if not ok:
+        import pytest
+
+        pytest.skip("onnx not installed")
+    proj = create_project("line_onnx_t", tmp_path, with_units=True, with_symbols=True)
+    bgr = np.zeros((36, 160, 3), dtype=np.uint8)
+    bgr[8:28, 10:150] = 220
+    save_line_sample(proj, bgr, (10, 8, 140, 20), "12万")
+    ckpt = train_line_project(proj, epochs=1, batch_size=2, synthetic=0, log=lambda _m: None)
+    out = export_line_onnx(proj, ckpt)
+    assert out.is_file()
+    assert (out.parent / "manifest.json").is_file()
+    manifest = (out.parent / "manifest.json").read_text(encoding="utf-8")
+    assert "line_crnn" in manifest

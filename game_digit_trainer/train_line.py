@@ -126,6 +126,7 @@ def train_line_project(
     synthetic: int | None = None,
     device: str | None = None,
     log=None,
+    should_stop=None,
 ) -> Path:
     def _log(msg: str) -> None:
         if log:
@@ -187,10 +188,15 @@ def train_line_project(
     bad_epochs = 0
 
     for epoch in range(1, epochs + 1):
+        if should_stop and should_stop():
+            _log("用户停止训练，保存当前最佳后退出")
+            break
         model.train()
         total = 0.0
         n = 0
         for xb, y_cat, in_lens, y_lens in loader:
+            if should_stop and should_stop():
+                break
             xb = xb.to(dev)
             y_cat = y_cat.to(dev)
             in_lens = in_lens.to(dev)

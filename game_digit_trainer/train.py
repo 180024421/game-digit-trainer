@@ -88,6 +88,7 @@ def train_project(
     device: str | None = None,
     augment: bool | None = None,
     log=None,
+    should_stop=None,
 ) -> Path:
     def _log(msg: str) -> None:
         if log:
@@ -140,11 +141,16 @@ def train_project(
     history: list[dict] = []
 
     for epoch in range(1, epochs + 1):
+        if should_stop and should_stop():
+            _log("用户停止训练，保存当前最佳后退出")
+            break
         model.train()
         total_loss = 0.0
         correct = 0
         total = 0
         for xb, yb in loader:
+            if should_stop and should_stop():
+                break
             xb, yb = xb.to(dev), yb.to(dev)
             opt.zero_grad()
             logits = model(xb)

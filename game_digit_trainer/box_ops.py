@@ -73,3 +73,33 @@ def auto_fix_boxes(boxes: list[Box]) -> tuple[list[Box], list[int]]:
     fixed = merge_tiny_boxes(boxes)
     tips = suggest_split_indices(fixed)
     return fixed, tips
+
+
+def is_oversized_box(
+    box: Box,
+    image_w: int,
+    image_h: int,
+    *,
+    width_ratio: float = 0.72,
+    area_ratio: float = 0.40,
+) -> bool:
+    """框是否大到像「整图/整行误选」（盖住后会挡住继续框选）。"""
+    if image_w <= 0 or image_h <= 0:
+        return False
+    _x, _y, w, h = box
+    if w <= 0 or h <= 0:
+        return False
+    if w >= int(image_w * width_ratio):
+        return True
+    return (w * h) >= int(image_w * image_h * area_ratio)
+
+
+def filter_giant_auto_boxes(
+    boxes: list[Box],
+    image_w: int,
+    image_h: int,
+) -> list[Box]:
+    """自动切字若只产出一个巨框，视为失败，返回空以免盖住画布。"""
+    if len(boxes) == 1 and is_oversized_box(boxes[0], image_w, image_h):
+        return []
+    return [b for b in boxes if not is_oversized_box(b, image_w, image_h)] or list(boxes)

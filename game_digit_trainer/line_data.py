@@ -100,6 +100,11 @@ def synthesize_line(
         n = random.randint(min_len, max_len)
         chosen = [random.choice(all_keys) for _ in range(n)]
 
+    while len(chosen) < min_len and digit_keys:
+        chosen.insert(0, random.choice(digit_keys))
+    if len(chosen) < min_len:
+        chosen.extend(random.choice(all_keys) for _ in range(min_len - len(chosen)))
+
     gap_px = gap if gap is not None else random.randint(1, 4)
     patches = [_resize_h(random.choice(pools[c])) for c in chosen]
     normed: list[np.ndarray] = []
