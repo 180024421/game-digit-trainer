@@ -28,6 +28,7 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QSizePolicy,
     QSpinBox,
     QSplitter,
     QTabWidget,
@@ -62,7 +63,17 @@ from game_digit_trainer.gui.theme import APP_QSS
 from game_digit_trainer.gui.ui_prefs import load_prefs, update_prefs
 from game_digit_trainer.gui.widgets import ImageCanvas, numpy_to_pixmap
 from game_digit_trainer.labels import display_label, normalize_label
-from game_digit_trainer.predict import check_onnx_dependency, predict_boxes_string, predict_pending_file, score_pending_files
+from game_digit_trainer.predict import (
+    ModelRef,
+    check_onnx_dependency,
+    check_onnxruntime_dependency,
+    list_project_models,
+    predict_boxes_string,
+    predict_boxes_with_model,
+    predict_pending_file,
+    resolve_onnx_pack,
+    score_pending_files,
+)
 from game_digit_trainer.preprocess import apply_preprocess, load_bgr
 from game_digit_trainer.project import (
     GameProject,
@@ -418,22 +429,46 @@ class MainWindow(QMainWindow):
         main_tools.addWidget(self.gap_spin)
         btn_preview = QPushButton("预览识别")
         btn_preview.setObjectName("primaryBtn")
-        btn_preview.setToolTip("对当前绿框跑模型，图上叠字 + 下方大号结果")
+        btn_preview.setToolTip("用当前工程最新 checkpoint 识别绿框（训练中快速试跑）")
         btn_preview.clicked.connect(self._preview_recognize)
         btn_split = QPushButton("拆粘连")
         btn_split.setToolTip("点选绿框后拆开；未选中时自动拆最宽的框")
         btn_split.clicked.connect(self._split_selected_box)
-        self.btn_more = QToolButton()
-        self.btn_more.setText("更多 ▾")
-        self.btn_more.setCheckable(True)
-        self.btn_more.setChecked(False)
-        self.btn_more.toggled.connect(self._toggle_work_more)
         main_tools.addWidget(btn_auto)
         main_tools.addWidget(btn_preview)
         main_tools.addWidget(btn_split)
         main_tools.addStretch()
-        main_tools.addWidget(self.btn_more)
         mid_l.addLayout(main_tools)
+
+        # 验模型：常驻，可切换 / 浏览外部 ONNX（其它电脑导出的包）
+        verify_box = QGroupBox("验模型（可选导出 ONNX 或本机 checkpoint）")
+        verify_l = QVBoxLayout(verify_box)
+        verify_row = QHBoxLayout()
+        verify_row.addWidget(QLabel("模型"))
+        self.verify_model_combo = QComboBox()
+        self.verify_model_combo.setMinimumWidth(220)
+        self.verify_model_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.verify_model_combo.setToolTip("列表含本工程 exports、runs，以及你浏览过的外部 ONNX 包")
+        btn_verify_refresh = QPushButton("刷新")
+        btn_verify_refresh.setToolTip("重新扫描本工程导出与 checkpoint")
+        btn_verify_refresh.clicked.connect(self._reload_verify_models)
+        btn_verify_browse = QPushButton("浏览 ONNX…")
+        btn_verify_browse.setToolTip("选择其它电脑拷来的 digits.onnx 或导出目录")
+        btn_verify_browse.clicked.connect(self._browse_verify_onnx)
+        btn_verify_run = QPushButton("用所选模型识别")
+        btn_verify_run.setObjectName("primaryBtn")
+        btn_verify_run.setToolTip("对当前截图绿字框/蓝 ROI 用下拉所选模型推理")
+        btn_verify_run.clicked.connect(self._verify_recognize_selected)
+        verify_row.addWidget(self.verify_model_combo, 1)
+        verify_row.addWidget(btn_verify_refresh)
+        verify_row.addWidget(btn_verify_browse)
+        verify_row.addWidget(btn_verify_run)
+        verify_l.addLayout(verify_row)
+        self.verify_hint = QLabel("可加载外部导出包；圈选区域后点「用所选模型识别」。")
+        self.verify_hint.setObjectName("hintLabel")
+        self.verify_hint.setWordWrap(True)
+        verify_l.addWidget(self.verify_hint)
+        mid_l.addWidget(verify_box)
 
         gold_row = QHBoxLayout()
         gold_row.addWidget(QLabel("金标"))
@@ -453,6 +488,17 @@ class MainWindow(QMainWindow):
         self.trial_result.setObjectName("hintLabel")
         self.trial_result.setWordWrap(True)
         mid_l.addWidget(self.trial_result)
+
+        # 高级选项：独立一行大按钮，收起后仍在原处可再展开
+        more_toggle_row = QHBoxLayout()
+        self.btn_more = QPushButton("高级选项 ▾（ROI 预设 / 缩放 / 定时刷样…）")
+        self.btn_more.setCheckable(True)
+        self.btn_more.setChecked(False)
+        self.btn_more.setMinimumHeight(36)
+        self.btn_more.setToolTip("展开或收起进阶工具；按钮始终留在此行，不会消失")
+        self.btn_more.toggled.connect(self._toggle_work_more)
+        more_toggle_row.addWidget(self.btn_more)
+        mid_l.addLayout(more_toggle_row)
 
         self.work_more = QWidget()
         more_l = QVBoxLayout(self.work_more)
@@ -1052,6 +1098,7 @@ class MainWindow(QMainWindow):
             self._sync_preprocess_ui_from_project()
             self._refresh_project_info()
             self._update_header()
+            self._reload_verify_models()
             self._status.showMessage(f"已自动打开最近项目：{self.project.config.game_id}")
         except Exception:
             pass
@@ -1081,6 +1128,7 @@ class MainWindow(QMainWindow):
         self._sync_preprocess_ui_from_project()
         self._refresh_project_info()
         self._update_header()
+        self._reload_verify_models()
         self.tabs.setCurrentIndex(self.TAB_WORK)
         self._status.showMessage(f"已创建（模板：{self.template_combo.currentText()}）")
 
@@ -1099,6 +1147,7 @@ class MainWindow(QMainWindow):
         self._reload_pending()
         self._reload_dataset_browser()
         self._update_header()
+        self._reload_verify_models()
         self.tabs.setCurrentIndex(self.TAB_WORK)
         self._status.showMessage(f"已打开 {self.project.config.game_id}")
 
@@ -2356,6 +2405,7 @@ class MainWindow(QMainWindow):
             "已导出",
             f"{out.parent}\n\n{verify_msg}\n\n拷到 Studio models/ 见 docs/studio-recognize-digits.md",
         )
+        self._reload_verify_models(prefer_key=f"onnx:{out.resolve()}")
 
     def _open_export_dir(self) -> None:
         proj = self._require_project()
@@ -3013,6 +3063,7 @@ class MainWindow(QMainWindow):
         else:
             self.guide_banner.setVisible(False)
         self._update_export_dep_hint()
+        self._reload_verify_models()
 
     def closeEvent(self, event) -> None:  # noqa: N802
         self._persist_ui_prefs()
@@ -3036,8 +3087,152 @@ class MainWindow(QMainWindow):
 
     def _toggle_work_more(self, checked: bool) -> None:
         self.work_more.setVisible(checked)
-        self.btn_more.setText("更多 ▴" if checked else "更多 ▾")
+        self.btn_more.setText(
+            "高级选项 ▴（点击收起）"
+            if checked
+            else "高级选项 ▾（ROI 预设 / 缩放 / 定时刷样…）"
+        )
         update_prefs(work_more_open=checked)
+
+    def _recent_onnx_paths(self) -> list[str]:
+        raw = self._ui_prefs.get("recent_onnx_models") or []
+        if not isinstance(raw, list):
+            return []
+        return [str(x) for x in raw if isinstance(x, str) and x.strip()]
+
+    def _remember_onnx_path(self, onnx_path: Path) -> None:
+        key = str(onnx_path.resolve())
+        recent = [key] + [p for p in self._recent_onnx_paths() if p != key]
+        recent = recent[:8]
+        self._ui_prefs = update_prefs(recent_onnx_models=recent, last_verify_model=f"onnx:{key}")
+
+    def _reload_verify_models(self, *, prefer_key: str | None = None) -> None:
+        if not hasattr(self, "verify_model_combo"):
+            return
+        combo = self.verify_model_combo
+        prev = prefer_key or combo.currentData()
+        if not prev:
+            prev = self._ui_prefs.get("last_verify_model")
+        combo.blockSignals(True)
+        combo.clear()
+        refs = list_project_models(self.project, recent_onnx=self._recent_onnx_paths())
+        if not refs:
+            combo.addItem("（无模型：请先导出，或点「浏览 ONNX…」加载外部包）", None)
+            combo.setEnabled(False)
+        else:
+            combo.setEnabled(True)
+            for ref in refs:
+                combo.addItem(ref.display, ref.key())
+            if prev:
+                idx = combo.findData(prev)
+                if idx >= 0:
+                    combo.setCurrentIndex(idx)
+        combo.blockSignals(False)
+        ort_ok, ort_msg = check_onnxruntime_dependency()
+        if hasattr(self, "verify_hint"):
+            tip = "可加载外部导出包；圈选后点「用所选模型识别」。"
+            if not ort_ok:
+                tip += f" ONNX 需安装: {ort_msg}"
+            self.verify_hint.setText(tip)
+
+    def _selected_verify_model(self) -> ModelRef | None:
+        if not hasattr(self, "verify_model_combo"):
+            return None
+        key = self.verify_model_combo.currentData()
+        if not key or not isinstance(key, str):
+            return None
+        for ref in list_project_models(self.project, recent_onnx=self._recent_onnx_paths()):
+            if ref.key() == key:
+                return ref
+        return None
+
+    def _browse_verify_onnx(self) -> None:
+        start = str(Path.home())
+        if self.project and self.project.exports_dir.is_dir():
+            start = str(self.project.exports_dir)
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择导出的 digits.onnx（其它电脑拷贝过来的也可以）",
+            start,
+            "ONNX (*.onnx);;All (*)",
+        )
+        if not path:
+            folder = QFileDialog.getExistingDirectory(
+                self,
+                "或选择导出目录（内含 digits.onnx + digits.labels）",
+                start,
+            )
+            if not folder:
+                return
+            path = folder
+        try:
+            ref = resolve_onnx_pack(Path(path))
+        except ValueError as exc:
+            QMessageBox.warning(self, "无法加载", str(exc))
+            return
+        ok, msg = check_onnxruntime_dependency()
+        if not ok:
+            QMessageBox.warning(
+                self,
+                "缺少运行时",
+                f"{msg}\n\n仍已加入列表；安装 onnxruntime 后即可用所选模型识别。",
+            )
+        self._remember_onnx_path(ref.path)
+        self._reload_verify_models(prefer_key=ref.key())
+        self._status.showMessage(f"已加入外部模型：{ref.display}")
+
+    def _verify_recognize_selected(self) -> None:
+        self._recognize_with_model(self._selected_verify_model(), silent=False)
+
+    def _recognize_with_model(self, model: ModelRef | None, *, silent: bool = False) -> None:
+        proj = self._require_project()
+        if not proj:
+            return
+        if model is None:
+            if not silent:
+                QMessageBox.information(
+                    self,
+                    "提示",
+                    "请先在「验模型」下拉中选择模型，或点「浏览 ONNX…」加载其它电脑导出的包。",
+                )
+            return
+        if model.kind == "onnx":
+            ok, msg = check_onnxruntime_dependency()
+            if not ok:
+                if not silent:
+                    QMessageBox.warning(self, "无法运行 ONNX", msg)
+                return
+        if not self._current_import:
+            if not silent:
+                QMessageBox.information(self, "提示", "请先打开或截取一张图")
+            return
+        boxes = self.import_canvas.boxes()
+        if not boxes:
+            if not silent:
+                self._auto_preview_boxes()
+                boxes = self.import_canvas.boxes()
+        if not boxes:
+            if not silent:
+                QMessageBox.warning(self, "提示", "请先框出字框或蓝 ROI")
+            return
+        try:
+            bgr = load_bgr(self._current_import)
+            conf = float(self.conf_spin.value()) if hasattr(self, "conf_spin") else 0.5
+            text, parts = predict_boxes_with_model(
+                proj, bgr, boxes, model, conf_threshold=conf
+            )
+        except Exception as exc:
+            if not silent:
+                QMessageBox.critical(self, "识别失败", str(exc))
+            return
+        self.import_canvas.set_predictions(parts)
+        if hasattr(self, "preview_big"):
+            self.preview_big.setText(text or "（空）")
+        detail = " ".join(f"{display_label(l)}({c:.0%})" for l, c in parts)
+        self.trial_result.setText(f"验模明细（{model.display}）：{detail}")
+        update_prefs(last_verify_model=model.key())
+        if not silent:
+            self._status.showMessage(f"识别：{text} ← {model.display}")
 
     def _undo_contextual(self) -> None:
         idx = self.tabs.currentIndex()
