@@ -20,8 +20,10 @@ cd E:\xiangmu\game-digit-trainer
 
 1. 顶部 **新建/打开** 项目  
 2. **①**：框选截屏 F2 → **整行蓝框** 圈数字 → **加入行待审**（约 30～50 条更好）  
-3. **②「行待审」**：填整串金标确认  
-4. **③**：**训练行模型** → **导出行 ONNX** → **拷行模型到 Studio**  
+   - 「更多」里可开 **定时刷样 / 多ROI刷样**（默认写入行待审）  
+   - **低置信自动入队**：识别偏低时自动进待审  
+3. **②「行待审」**：填整串金标；可 **全部预标排序**、**批量确认高置信行**  
+4. **③**：**训练行模型**（可选设备/workers）→ **行样本评估** / **补样建议** → **导出行 ONNX**（含质量门禁）→ **拷行模型到 Studio**  
 5. Studio：`bot.recognizeDigits({ roi=..., model="models/line/digits_line" })`  
 
 换机/备份标注：③ 页 **导出标注包** / **导入标注包**（单字 + 行样本/待审 + 难例；不含模型）。也可「备份项目」打整包。
@@ -33,11 +35,14 @@ cd E:\xiangmu\game-digit-trainer
 ## CLI
 
 ```powershell
-.\.venv\Scripts\python -m game_digit_trainer create mygame --symbols
-.\.venv\Scripts\python -m game_digit_trainer segment --project projects\mygame --image hud.png
-.\.venv\Scripts\python -m game_digit_trainer train --project projects\mygame
-.\.venv\Scripts\python -m game_digit_trainer export --project projects\mygame
+.\.venv\Scripts\python -m game_digit_trainer create mygame --symbols --units
+.\.venv\Scripts\python -m game_digit_trainer train-line --project projects\mygame
+.\.venv\Scripts\python -m game_digit_trainer export-line --project projects\mygame
+.\.venv\Scripts\python -m game_digit_trainer predict-line --project projects\mygame --image roi.png
+.\.venv\Scripts\python -m game_digit_trainer bootstrap-chars --project projects\mygame
 ```
+
+旧单字路径仍可用：`train` / `export` / `predict`。
 
 ## 文档
 

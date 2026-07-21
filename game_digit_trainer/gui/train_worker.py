@@ -22,12 +22,20 @@ class TrainWorker(QThread):
         *,
         augment: bool = True,
         line_mode: bool = False,
+        finetune: bool = True,
+        auto_bootstrap: bool = False,
+        device: str | None = None,
+        num_workers: int | None = None,
     ) -> None:
         super().__init__()
         self.project = project
         self.epochs = epochs
         self.augment = augment
         self.line_mode = line_mode
+        self.finetune = finetune
+        self.auto_bootstrap = auto_bootstrap
+        self.device = device
+        self.num_workers = num_workers
         self._stop = False
 
     def request_stop(self) -> None:
@@ -40,6 +48,11 @@ class TrainWorker(QThread):
                 path = train_line_project(
                     self.project,
                     epochs=self.epochs,
+                    augment_real=self.augment,
+                    finetune=self.finetune,
+                    auto_bootstrap=self.auto_bootstrap,
+                    device=self.device,
+                    num_workers=self.num_workers,
                     log=lambda m: self.log.emit(m),
                     should_stop=stop,
                 )
@@ -54,5 +67,3 @@ class TrainWorker(QThread):
             self.done.emit(str(path))
         except Exception as exc:
             self.failed.emit(f"{exc}\n{traceback.format_exc()}")
-
-

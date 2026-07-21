@@ -41,7 +41,15 @@ def list_line_pending(project: GameProject) -> list[Path]:
     )
 
 
-def load_char_pools(project: GameProject) -> dict[str, list[np.ndarray]]:
+def load_char_pools(
+    project: GameProject,
+    *,
+    include_bootstrap: bool = False,
+) -> dict[str, list[np.ndarray]]:
+    """加载单字图池。默认排除 from_line_* 粗切（易脏，勿用于合成行）。
+
+    include_bootstrap=True 时才混入粗切图（仅「自动粗切合成」开启时）。
+    """
     pools: dict[str, list[np.ndarray]] = {}
     for name in project.config.classes:
         folder = project.dataset_dir / name
@@ -50,6 +58,8 @@ def load_char_pools(project: GameProject) -> dict[str, list[np.ndarray]]:
         imgs: list[np.ndarray] = []
         for p in folder.iterdir():
             if p.suffix.lower() not in {".png", ".jpg", ".jpeg", ".bmp"}:
+                continue
+            if not include_bootstrap and p.name.startswith("from_line_"):
                 continue
             raw = np.fromfile(str(p), dtype=np.uint8)
             img = cv2.imdecode(raw, cv2.IMREAD_GRAYSCALE)
@@ -217,6 +227,9 @@ def save_line_pending(
     region: tuple[int, int, int, int] | None,
     *,
     source_name: str = "roi",
+    pred: str = "",
+    conf: float = 0.0,
+    hint: str = "",
 ) -> Path:
     """框选区域裁成行图，进入行待审（先不填字）。"""
     if region is None:
@@ -237,6 +250,8 @@ def save_line_pending(
     if not ok:
         raise RuntimeError("无法编码行图")
     out.write_bytes(buf.tobytes())
+    if pred or hint or conf:
+        set_line_pending_hint(project, out.name, pred=pred, conf=conf, hint=hint)
     return out
 
 
@@ -255,6 +270,7 @@ def confirm_line_pending(project: GameProject, pending: Path, text: str) -> Path
         n += 1
     dest.write_bytes(pending.read_bytes())
     pending.unlink(missing_ok=True)
+    clear_line_pending_hint(project, pending.name)
     with lines_labels_path(project).open("a", encoding="utf-8") as f:
         f.write(json.dumps({"image": dest.name, "text": display}, ensure_ascii=False) + "\n")
     return dest
@@ -347,6 +363,239 @@ def clear_line_samples(project: GameProject) -> int:
     if path.is_file():
         path.write_text("", encoding="utf-8")
     return len(items)
+
+
+def _split_widths_by_ink(gray: np.ndarray, n: int) -> list[tuple[int, int]]:
+    """按墨迹投影粗分 n 段，失败则等宽。返回 [(x0,x1), ...]。"""
+    h, w = gray.shape[:2]
+    if n <= 0 or w < n * 2:
+        return []
+    g = gray
+    if float(np.mean(g)) > 127:
+        g = 255 - g
+    col = (g > 30).sum(axis=0).astype(np.float32)
+    if float(col.sum()) < 1:
+        # 等宽
+        step = w / n
+        return [(int(i * step), int((i + 1) * step)) for i in range(n)]
+    # 累积墨迹分位数切分
+    cdf = np.cumsum(col)
+    total = float(cdf[-1])
+    cuts = [0]
+    for i in range(1, n):
+        target = total * i / n
+        x = int(np.searchsorted(cdf, target))
+        cuts.append(max(cuts[-1] + 1, min(w - (n - i), x)))
+    cuts.append(w)
+    return [(cuts[i], cuts[i + 1]) for i in range(n)]
+
+
+def bootstrap_chars_from_line_samples(
+    project: GameProject,
+    *,
+    max_per_class: int = 80,
+) -> tuple[dict[str, int], list[tuple[str, Path, str]]]:
+    """
+    从已标行样本按金标粗切单字写入 dataset/，便于合成更多数字组合。
+
+    返回 (各类新增数量, 预览列表[(类名, 图片路径, 来源行金标)])。
+    """
+    classes = list(project.config.classes)
+    added: dict[str, int] = {c: 0 for c in classes}
+    previews: list[tuple[str, Path, str]] = []
+    project.ensure_dirs()
+    for path, text in list_line_labeled(project):
+        if not text.strip():
+            continue
+        try:
+            tokens = tokenize_expected(text, classes)
+        except Exception:
+            continue
+        if not tokens:
+            continue
+        raw = np.fromfile(str(path), dtype=np.uint8)
+        gray = cv2.imdecode(raw, cv2.IMREAD_GRAYSCALE)
+        if gray is None or gray.size == 0:
+            continue
+        spans = _split_widths_by_ink(gray, len(tokens))
+        if len(spans) != len(tokens):
+            continue
+        _h, w = gray.shape[:2]
+        for tok, (x0, x1) in zip(tokens, spans):
+            if added.get(tok, 0) >= max_per_class:
+                continue
+            x0 = max(0, min(w - 1, x0))
+            x1 = max(x0 + 1, min(w, x1))
+            pad = max(1, (x1 - x0) // 10)
+            xa = max(0, x0 - pad)
+            xb = min(w, x1 + pad)
+            crop = gray[:, xa:xb]
+            if crop.shape[1] < 2:
+                continue
+            dest_dir = project.dataset_dir / tok
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            out = dest_dir / f"from_line_{path.stem}_{added[tok]:03d}.png"
+            while out.exists():
+                added[tok] += 1
+                if added[tok] >= max_per_class:
+                    break
+                out = dest_dir / f"from_line_{path.stem}_{added[tok]:03d}.png"
+            if added[tok] >= max_per_class:
+                continue
+            ok, buf = cv2.imencode(".png", crop)
+            if not ok:
+                continue
+            out.write_bytes(buf.tobytes())
+            added[tok] = added.get(tok, 0) + 1
+            if len(previews) < 48:
+                previews.append((tok, out, text))
+    return {k: v for k, v in added.items() if v > 0}, previews
+
+
+def clear_bootstrap_chars(project: GameProject) -> int:
+    """删除 dataset/ 下 from_line_* 粗切单字，返回删除文件数。"""
+    n = 0
+    root = project.dataset_dir
+    if not root.is_dir():
+        return 0
+    for folder in root.iterdir():
+        if not folder.is_dir():
+            continue
+        for p in folder.glob("from_line_*.png"):
+            p.unlink(missing_ok=True)
+            n += 1
+        for p in folder.glob("from_line_*.jpg"):
+            p.unlink(missing_ok=True)
+            n += 1
+    return n
+
+
+def line_pending_hints_path(project: GameProject) -> Path:
+    return lines_dir(project) / "pending_hints.json"
+
+
+def load_line_pending_hints(project: GameProject) -> dict[str, dict]:
+    path = line_pending_hints_path(project)
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_line_pending_hints(project: GameProject, hints: dict[str, dict]) -> None:
+    path = line_pending_hints_path(project)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(hints, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def set_line_pending_hint(
+    project: GameProject,
+    filename: str,
+    *,
+    pred: str = "",
+    conf: float = 0.0,
+    hint: str = "",
+) -> None:
+    hints = load_line_pending_hints(project)
+    hints[filename] = {
+        "pred": pred or "",
+        "conf": float(conf),
+        "hint": hint or "",
+    }
+    save_line_pending_hints(project, hints)
+
+
+def get_line_pending_hint(project: GameProject, filename: str) -> dict:
+    return dict(load_line_pending_hints(project).get(filename) or {})
+
+
+def clear_line_pending_hint(project: GameProject, filename: str) -> None:
+    hints = load_line_pending_hints(project)
+    if filename in hints:
+        del hints[filename]
+        save_line_pending_hints(project, hints)
+
+
+def line_coverage_report(project: GameProject) -> dict[str, object]:
+    """行样本形态覆盖：长度 / 小数 / 单位 / 纯数字。"""
+    items = list_line_labeled(project)
+    classes = list(project.config.classes)
+    lengths: dict[int, int] = {}
+    with_dot = 0
+    with_unit = 0
+    plain = 0
+    for _path, text in items:
+        if not text.strip():
+            continue
+        try:
+            tokens = tokenize_expected(text, classes)
+        except Exception:
+            continue
+        n = len(tokens)
+        lengths[n] = lengths.get(n, 0) + 1
+        if "dot" in tokens:
+            with_dot += 1
+        if any(t in {"wan", "yi"} for t in tokens):
+            with_unit += 1
+        if all(t.isdigit() for t in tokens):
+            plain += 1
+    return {
+        "total": len(items),
+        "lengths": dict(sorted(lengths.items())),
+        "with_dot": with_dot,
+        "with_unit": with_unit,
+        "plain": plain,
+    }
+
+
+def coverage_fill_suggestions(
+    project: GameProject,
+    *,
+    target_total: int = 30,
+    min_dot: int = 3,
+    min_unit: int = 5,
+    min_plain: int = 5,
+) -> list[str]:
+    """根据覆盖度给出可执行补样建议。"""
+    cov = line_coverage_report(project)
+    total = int(cov.get("total") or 0)
+    tips: list[str] = []
+    if total < target_total:
+        tips.append(f"还差约 {target_total - total} 条整行样本（目标 ≥{target_total}）")
+    if int(cov.get("with_dot") or 0) < min_dot:
+        tips.append(f"补 {min_dot - int(cov.get('with_dot') or 0)} 条带小数的（如 1.9 / 12.5万）")
+    if int(cov.get("with_unit") or 0) < min_unit:
+        tips.append(f"补 {min_unit - int(cov.get('with_unit') or 0)} 条带「万/亿」的")
+    if int(cov.get("plain") or 0) < min_plain:
+        tips.append(f"补 {min_plain - int(cov.get('plain') or 0)} 条纯数字（如 6370）")
+    lengths = cov.get("lengths") or {}
+    if total >= 8 and not any(int(k) >= 4 for k in lengths):
+        tips.append("补几条 4 位以上长数字（防短串过拟合）")
+    if not tips and total > 0:
+        tips.append("形态覆盖尚可，可继续用同 HUD 刷几条再续训")
+    return tips
+
+
+def suggest_line_max_width(samples: list[tuple[np.ndarray, list[int]]]) -> int:
+    """按样本实际行宽建议 pad 宽度，短数字少算空白。"""
+    if not samples:
+        return LINE_MAX_WIDTH
+    widths: list[int] = []
+    for img, _ in samples:
+        g = img
+        if g.ndim == 3:
+            g = cv2.cvtColor(g, cv2.COLOR_BGR2GRAY)
+        if float(np.mean(g)) > 127:
+            g = 255 - g
+        g = _resize_h(g, LINE_HEIGHT)
+        widths.append(int(g.shape[1]))
+    need = max(widths) + 16
+    # 对齐到 8，便于 CNN 下采样
+    need = int((need + 7) // 8 * 8)
+    return int(min(LINE_MAX_WIDTH, max(64, need)))
 
 
 def ctc_greedy_decode(logits_t_n_c: np.ndarray, blank_index: int) -> list[int]:

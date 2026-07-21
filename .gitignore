@@ -10,3 +10,6 @@ projects/
 *.onnx
 .DS_Store
 Thumbs.db
+_match_debug/
+_roi_debug/
+adb_*.png

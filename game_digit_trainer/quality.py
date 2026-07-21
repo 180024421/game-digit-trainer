@@ -53,6 +53,29 @@ def export_quality_report(
     return errors, warnings
 
 
+def line_export_quality_report(
+    project: GameProject,
+    checkpoint: Path,
+    *,
+    min_lines: int = 10,
+    min_val_acc: float = 0.7,
+) -> tuple[list[str], list[str]]:
+    """行模型导出门禁：(errors, warnings)。"""
+    from game_digit_trainer.line_data import count_line_labeled
+
+    errors: list[str] = []
+    warnings: list[str] = []
+    line_n = count_line_labeled(project)
+    if line_n < min_lines:
+        errors.append(f"行样本过少（{line_n} < {min_lines}），建议多标几条 HUD 再导出")
+    elif line_n < 30:
+        warnings.append(f"行样本 {line_n} 条，建议标到约 30～50 条更稳")
+    warnings.extend(checkpoint_acc_gate(checkpoint, min_val_acc=min_val_acc))
+    if not checkpoint.is_file():
+        errors.append(f"找不到行 checkpoint: {checkpoint}")
+    return errors, warnings
+
+
 def verify_onnx_runtime(onnx_path: Path, *, width: int, height: int) -> str:
     """用 onnxruntime（若已装）跑一次 dummy；否则仅检查文件存在。"""
     if not onnx_path.is_file():

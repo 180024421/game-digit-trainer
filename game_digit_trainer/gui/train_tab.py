@@ -21,13 +21,40 @@ class TrainTabMixin:
         form.addWidget(QLabel("轮数"))
         self.epochs_spin = QSpinBox()
         self.epochs_spin.setRange(1, 200)
-        self.epochs_spin.setValue(15)
+        self.epochs_spin.setValue(12)
+        self.epochs_spin.setToolTip("行模型常 8～15 轮够用；勾选「续训上次」后可更少")
         form.addWidget(self.epochs_spin)
         self.chk_augment = QCheckBox("数据增强")
         self.chk_augment.setChecked(True)
         self.chk_augment.setToolTip("训练时轻微位移/对比度/缩放/噪声，截图少也能更稳")
         self.chk_augment.stateChanged.connect(self._persist_augment)
         form.addWidget(self.chk_augment)
+        self.chk_finetune = QCheckBox("续训上次")
+        self.chk_finetune.setChecked(True)
+        self.chk_finetune.setToolTip(
+            "有上次行模型时接着训（更快，适合补样本后）。取消则从头训练。"
+        )
+        form.addWidget(self.chk_finetune)
+        self.chk_auto_bootstrap = QCheckBox("自动粗切合成")
+        self.chk_auto_bootstrap.setChecked(False)
+        self.chk_auto_bootstrap.setToolTip(
+            "默认关闭。粗切单字常不干净，会污染合成行。"
+            "行模型主靠整行样本即可；仅在你确认粗切预览还行时再勾选。"
+        )
+        form.addWidget(self.chk_auto_bootstrap)
+        form.addWidget(QLabel("设备"))
+        self.device_combo = QComboBox()
+        self.device_combo.addItem("自动", "auto")
+        self.device_combo.addItem("CPU", "cpu")
+        self.device_combo.addItem("CUDA", "cuda")
+        self.device_combo.setToolTip("行训练设备；无显卡时 CUDA 会自动回退")
+        form.addWidget(self.device_combo)
+        form.addWidget(QLabel("workers"))
+        self.workers_spin = QSpinBox()
+        self.workers_spin.setRange(0, 8)
+        self.workers_spin.setValue(0)
+        self.workers_spin.setToolTip("DataLoader 进程数；0=主线程（Windows 最稳），有 GPU 可试 2")
+        form.addWidget(self.workers_spin)
         self.chk_force_export = QCheckBox("强制导出")
         self.chk_force_export.setToolTip("忽略质量门禁（样本不足/准确率偏低）")
         form.addWidget(self.chk_force_export)
@@ -43,6 +70,17 @@ class TrainTabMixin:
         )
         btn_train_line.clicked.connect(self._start_train_line)
         form.addWidget(btn_train_line)
+        btn_boot_chars = QPushButton("行→单字粗切")
+        btn_boot_chars.setToolTip(
+            "可选：粗切进 dataset 并弹预览。切得不好请点「清除粗切」，不要用来训行模型合成。"
+        )
+        btn_boot_chars.clicked.connect(self._bootstrap_chars_from_lines)
+        form.addWidget(btn_boot_chars)
+        btn_clear_boot = QPushButton("清除粗切")
+        btn_clear_boot.setObjectName("dangerBtn")
+        btn_clear_boot.setToolTip("删除 dataset 里所有 from_line_* 粗切图（不影响真实行样本）")
+        btn_clear_boot.clicked.connect(self._clear_bootstrap_chars)
+        form.addWidget(btn_clear_boot)
         self.btn_stop_train = QPushButton("停止训练")
         self.btn_stop_train.setObjectName("dangerBtn")
         self.btn_stop_train.setEnabled(False)
@@ -99,9 +137,17 @@ class TrainTabMixin:
         btn_reg_run = QPushButton("跑回归集")
         btn_reg_run.setToolTip("优先用最新行模型；无行模型时用单字 checkpoint")
         btn_reg_run.clicked.connect(self._run_regression)
+        btn_line_eval = QPushButton("行样本评估")
+        btn_line_eval.setToolTip("对全部已标行样本跑行模型，看准确率与错例")
+        btn_line_eval.clicked.connect(self._evaluate_line_samples)
+        btn_cov = QPushButton("补样建议")
+        btn_cov.setToolTip("根据行形态覆盖度提示还缺什么样本")
+        btn_cov.clicked.connect(self._show_coverage_suggestions)
         bal_row.addWidget(btn_boost)
         bal_row.addWidget(btn_scarce)
         bal_row.addWidget(btn_reg_run)
+        bal_row.addWidget(btn_line_eval)
+        bal_row.addWidget(btn_cov)
         btn_conf = QPushButton("混淆矩阵")
         btn_conf.clicked.connect(self._show_confusion)
         btn_backup = QPushButton("备份项目")
@@ -143,6 +189,7 @@ class TrainTabMixin:
         self.ds_class_list.currentTextChanged.connect(self._on_ds_class)
         self.ds_file_list = QListWidget()
         self.ds_file_list.currentRowChanged.connect(self._on_ds_file)
+        self.ds_file_list.itemClicked.connect(lambda _i: self._on_ds_file(self.ds_file_list.currentRow()))
         row.addWidget(self.ds_class_list)
         row.addWidget(self.ds_file_list, 1)
         rl.addLayout(row, 1)
@@ -150,8 +197,21 @@ class TrainTabMixin:
         self.ds_preview = QLabel("选样本")
         self.ds_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.ds_preview.setFixedHeight(140)
+        self.ds_preview.setMinimumWidth(200)
         self.ds_preview.setStyleSheet("background:#111827; color:#9ca3af; border-radius:8px;")
         rl.addWidget(self.ds_preview)
+        self.ds_model_pred = QLabel("模型试读：选中行样本后自动用最新行模型识别")
+        self.ds_model_pred.setObjectName("hintLabel")
+        self.ds_model_pred.setWordWrap(True)
+        rl.addWidget(self.ds_model_pred)
+        pred_row = QHBoxLayout()
+        btn_ds_pred = QPushButton("模型试读")
+        btn_ds_pred.setObjectName("primaryBtn")
+        btn_ds_pred.setToolTip("用最新行模型（或单字模型）识别当前选中样本，对比金标")
+        btn_ds_pred.clicked.connect(self._ds_preview_model)
+        pred_row.addWidget(btn_ds_pred)
+        pred_row.addStretch()
+        rl.addLayout(pred_row)
 
         line_edit_row = QHBoxLayout()
         self.ds_line_edit = QLineEdit()
@@ -202,6 +262,23 @@ class TrainTabMixin:
             f"行样本已标: {line_n} · 行待审: {line_pending_n}",
             "",
         ]
+        try:
+            from game_digit_trainer.line_data import line_coverage_report
+
+            cov = line_coverage_report(self.project)
+            if int(cov.get("total") or 0) > 0:
+                lens = cov.get("lengths") or {}
+                lens_txt = " ".join(f"{k}字×{v}" for k, v in lens.items()) or "—"
+                lines.append(
+                    f"行形态覆盖: 纯数字 {cov.get('plain')} · 带小数 {cov.get('with_dot')} · "
+                    f"带万/亿 {cov.get('with_unit')} · 长度[{lens_txt}]"
+                )
+                tips = coverage_fill_suggestions(self.project)
+                if tips:
+                    lines.append("补样建议: " + "；".join(tips[:3]))
+                lines.append("")
+        except Exception:
+            pass
         for k, v in counts.items():
             if v:
                 lines.append(f"  {display_label(k)}: {v}")
@@ -246,8 +323,11 @@ class TrainTabMixin:
         self.ds_class_list.clear()
         self.ds_file_list.clear()
         self.ds_move_combo.clear()
+        self.ds_preview.clear()
         self.ds_preview.setText("选样本")
         self._set_ds_line_controls(False)
+        if hasattr(self, "ds_model_pred"):
+            self.ds_model_pred.setText("模型试读：选中行样本后自动用最新行模型识别")
         if not self.project:
             return
         line_n = count_line_labeled(self.project)
@@ -274,7 +354,10 @@ class TrainTabMixin:
 
     def _on_ds_class(self, _text: str) -> None:
         self.ds_file_list.clear()
+        self.ds_preview.clear()
         self.ds_preview.setText("选样本")
+        if hasattr(self, "ds_model_pred"):
+            self.ds_model_pred.setText("模型试读：—")
         if not self.project:
             return
         item = self.ds_class_list.currentItem()
@@ -289,36 +372,136 @@ class TrainTabMixin:
                 it.setData(Qt.ItemDataRole.UserRole, str(path))
                 it.setData(Qt.ItemDataRole.UserRole + 1, text)
                 self.ds_file_list.addItem(it)
+            if self.ds_file_list.count() > 0:
+                self.ds_file_list.setCurrentRow(0)
             return
         self._set_ds_line_controls(False)
         for p in list_dataset_files(self.project, label):
             it = QListWidgetItem(p.name)
             it.setData(Qt.ItemDataRole.UserRole, str(p))
             self.ds_file_list.addItem(it)
+        if self.ds_file_list.count() > 0:
+            self.ds_file_list.setCurrentRow(0)
 
     def _on_ds_file(self, row: int) -> None:
         if row < 0:
             return
         item = self.ds_file_list.item(row)
+        if not item:
+            return
         path = Path(item.data(Qt.ItemDataRole.UserRole))
+        if not path.is_file():
+            self.ds_preview.clear()
+            self.ds_preview.setText("文件不存在")
+            return
         raw = np.fromfile(str(path), dtype=np.uint8)
         img = cv2.imdecode(raw, cv2.IMREAD_GRAYSCALE)
         if img is None:
+            self.ds_preview.clear()
             self.ds_preview.setText("无法读取")
             return
         max_w, max_h = (280, 120) if self._ds_is_line_mode() else (120, 120)
-        self.ds_preview.setPixmap(
-            numpy_to_pixmap(img).scaled(
-                max_w,
-                max_h,
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.FastTransformation,
-            )
+        show = img
+        # 行图常偏暗，归一化一下方便看见
+        if show.size and float(np.mean(show)) < 90:
+            show = cv2.normalize(show, None, 40, 255, cv2.NORM_MINMAX)
+        pix = numpy_to_pixmap(show).scaled(
+            max_w,
+            max_h,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.FastTransformation,
         )
+        # 避免残留「选样本」文字盖住图
+        self.ds_preview.clear()
+        self.ds_preview.setPixmap(pix)
+        self.ds_preview.setText("")
         if self._ds_is_line_mode():
             text = item.data(Qt.ItemDataRole.UserRole + 1) or ""
             self.ds_line_edit.setText(str(text))
             self.ds_line_edit.setFocus()
+            self._ds_preview_model(silent=True)
+        elif hasattr(self, "ds_model_pred"):
+            self.ds_model_pred.setText("单字样本：可点「模型试读」用单字 checkpoint 试读")
+
+    def _ds_preview_model(self, silent: bool = False) -> None:
+        """用最新行/单字模型识别当前选中样本，并与金标对比。"""
+        proj = self._require_project() if not silent else self.project
+        if not proj:
+            return
+        path = self._current_ds_path()
+        if not path or not path.is_file():
+            if not silent:
+                QMessageBox.information(self, "提示", "请先选中一条样本")
+            return
+        if not hasattr(self, "ds_model_pred"):
+            return
+
+        if self._ds_is_line_mode():
+            ckpt = latest_line_checkpoint(proj)
+            if not ckpt:
+                self.ds_model_pred.setText("模型试读：尚未训练行模型（③ 点「训练行模型」）")
+                if not silent:
+                    QMessageBox.information(self, "提示", "还没有行模型，请先训练")
+                return
+            try:
+                from game_digit_trainer.predict_line import load_line_checkpoint, predict_line_gray
+
+                raw = np.fromfile(str(path), dtype=np.uint8)
+                gray = cv2.imdecode(raw, cv2.IMREAD_GRAYSCALE)
+                if gray is None:
+                    raise RuntimeError("无法读取行图")
+                model, classes, _h, max_w = load_line_checkpoint(ckpt)
+                text, parts, mean_conf = predict_line_gray(model, classes, gray, max_w=max_w)
+            except Exception as exc:
+                self.ds_model_pred.setText(f"模型试读失败：{exc}")
+                if not silent:
+                    QMessageBox.warning(self, "试读失败", str(exc))
+                return
+            gold = ""
+            item = self.ds_file_list.currentItem()
+            if item:
+                gold = str(item.data(Qt.ItemDataRole.UserRole + 1) or "")
+            ok = bool(gold) and text == gold
+            mark = "✓" if ok else ("≠" if gold else "·")
+            detail = " ".join(f"{display_label(l)}({c:.0%})" for l, c in parts) or f"{mean_conf:.0%}"
+            self.ds_model_pred.setText(
+                f"模型试读 {mark}  读「{text or '（空）'}」"
+                + (f"  金标「{gold}」" if gold else "")
+                + f"  ·  置信 {mean_conf:.0%}  ·  {ckpt.parent.name}\n{detail}"
+            )
+            self.ds_model_pred.setStyleSheet(
+                "color:#059669;" if ok else ("color:#d97706;" if gold else "")
+            )
+            if not silent:
+                self._status.showMessage(f"行模型试读：{text}（金标 {gold or '—'}）")
+            return
+
+        # 单字路径
+        ckpt = latest_checkpoint(proj)
+        if not ckpt:
+            self.ds_model_pred.setText("模型试读：尚未训练单字模型")
+            if not silent:
+                QMessageBox.information(self, "提示", "还没有单字模型")
+            return
+        try:
+            lab, conf = predict_pending_file(
+                ckpt,
+                path,
+                proj.config.classes,
+                proj.config.input_width,
+                proj.config.input_height,
+            )
+        except Exception as exc:
+            self.ds_model_pred.setText(f"模型试读失败：{exc}")
+            if not silent:
+                QMessageBox.warning(self, "试读失败", str(exc))
+            return
+        self.ds_model_pred.setText(
+            f"单字试读：{display_label(lab)}（{conf:.0%}）← {ckpt.parent.name}"
+        )
+        self.ds_model_pred.setStyleSheet("")
+        if not silent:
+            self._status.showMessage(f"单字试读：{display_label(lab)}")
 
     def _current_ds_path(self) -> Path | None:
         item = self.ds_file_list.currentItem()
@@ -439,6 +622,58 @@ class TrainTabMixin:
         self._status.showMessage(f"已清空类别 {display_label(name)}（{len(files)}）")
 
     # ---------- train / export ----------
+    def _bootstrap_chars_from_lines(self) -> None:
+        proj = self._require_project()
+        if not proj:
+            return
+        n_line = count_line_labeled(proj)
+        if n_line <= 0:
+            QMessageBox.information(self, "提示", "还没有行样本，请先标一些整行再粗切")
+            return
+        try:
+            added, previews = bootstrap_chars_from_line_samples(proj)
+        except Exception as exc:
+            QMessageBox.warning(self, "粗切失败", str(exc))
+            return
+        total = sum(added.values())
+        if total <= 0:
+            QMessageBox.information(self, "提示", "未能切出单字（请检查行金标是否完整）")
+            return
+        self._refresh_project_info()
+        if hasattr(self, "_reload_dataset_browser"):
+            self._reload_dataset_browser()
+            # 选中第一个有新增的单字类，方便立刻查看
+            for i in range(self.ds_class_list.count()):
+                key = self.ds_class_list.item(i).data(Qt.ItemDataRole.UserRole)
+                if key in added:
+                    self.ds_class_list.setCurrentRow(i)
+                    break
+        self._status.showMessage(f"已粗切单字 {total} 张 — 见预览窗口 / 右侧样本库")
+        from game_digit_trainer.gui.bootstrap_preview import show_bootstrap_preview
+
+        show_bootstrap_preview(self, added, previews)
+
+    def _clear_bootstrap_chars(self) -> None:
+        proj = self._require_project()
+        if not proj:
+            return
+        reply = QMessageBox.question(
+            self,
+            "清除粗切单字",
+            "将删除 dataset 中所有 from_line_* 粗切图。\n"
+            "不影响 lines/ 行样本，也不影响你手工切的单字。\n继续？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        n = clear_bootstrap_chars(proj)
+        self._refresh_project_info()
+        if hasattr(self, "_reload_dataset_browser"):
+            self._reload_dataset_browser()
+        self._status.showMessage(f"已清除粗切单字 {n} 张")
+        QMessageBox.information(self, "已清除", f"已删除 {n} 张粗切图。之后训行模型请保持「自动粗切合成」关闭。")
+
     def _start_train(self) -> None:
         proj = self._require_project()
         if not proj:
@@ -486,7 +721,7 @@ class TrainTabMixin:
 
         line_n = count_line_labeled(proj)
         char_n = sum(proj.class_counts().values())
-        has_pools = bool(load_char_pools(proj))
+        has_pools = bool(load_char_pools(proj, include_bootstrap=False))
         if line_n <= 0 and not has_pools:
             QMessageBox.warning(
                 self,
@@ -518,14 +753,40 @@ class TrainTabMixin:
                 "当前无真实行样本，将用单字拼成行图训练（精度通常不如真实 HUD）。"
                 "建议之后多标行样本再训。"
             )
-        # 精度优先：至少 20 轮，尊重用户调高的轮数
-        epochs = max(20, int(self.epochs_spin.value()))
-        self._worker = TrainWorker(proj, epochs, augment=False, line_mode=True)
+        # 尊重轮数；loss 很低会早停，不必强制至少 20
+        epochs = max(5, int(self.epochs_spin.value()))
+        augment = self.chk_augment.isChecked()
+        finetune = hasattr(self, "chk_finetune") and self.chk_finetune.isChecked()
+        auto_boot = (
+            hasattr(self, "chk_auto_bootstrap") and self.chk_auto_bootstrap.isChecked()
+        )
+        device = "auto"
+        if hasattr(self, "device_combo"):
+            device = str(self.device_combo.currentData() or "auto")
+        workers = None
+        if hasattr(self, "workers_spin"):
+            workers = int(self.workers_spin.value())
+        self._worker = TrainWorker(
+            proj,
+            epochs,
+            augment=augment,
+            line_mode=True,
+            finetune=finetune,
+            auto_bootstrap=auto_boot,
+            device=None if device == "auto" else device,
+            num_workers=workers,
+        )
         self._worker.log.connect(lambda m: self.train_log.append(m))
         self._worker.done.connect(self._train_line_done)
         self._worker.failed.connect(self._on_train_failed)
         if hasattr(self, "btn_stop_train"):
             self.btn_stop_train.setEnabled(True)
+        tip = "续训上次" if finetune else "从头训练"
+        boot = "·自动粗切开" if auto_boot else "·自动粗切关"
+        self.train_log.append(
+            f"开始训练（{tip}{boot}·设备{device}·workers={workers}）：轮数={epochs}。"
+            "可点停止；loss/验证准确率稳定会提前结束。"
+        )
         self._worker.start()
 
     def _stop_train(self) -> None:
@@ -545,6 +806,9 @@ class TrainTabMixin:
             self.btn_stop_train.setEnabled(False)
         self.train_log.append(f"行模型完成: {path}")
         self._refresh_project_info()
+        self._refresh_train_curve()
+        if hasattr(self, "_reload_dataset_browser"):
+            self._reload_dataset_browser()
         self._reload_verify_models()
         self._status.showMessage(f"行模型完成: {path} — 可用蓝框「识别」试读，或「导出行 ONNX」")
         line_n = count_line_labeled(self.project) if self.project else 0
@@ -574,21 +838,39 @@ class TrainTabMixin:
     def _refresh_train_curve(self) -> None:
         if not hasattr(self, "curve_label") or not self.project:
             return
-        runs = sorted(self.project.runs_dir.glob("*/metrics.json"), key=lambda p: p.stat().st_mtime, reverse=True)
-        if not runs:
-            self.curve_label.setText("训练曲线：尚无")
-            return
         import json
 
+        line_runs = sorted(
+            self.project.runs_dir.glob("*/line_metrics.json"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        char_runs = sorted(
+            self.project.runs_dir.glob("*/metrics.json"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        # 优先展示更新的那份
+        candidates: list[tuple[float, Path, str]] = []
+        for p in line_runs[:1]:
+            candidates.append((p.stat().st_mtime, p, "行"))
+        for p in char_runs[:1]:
+            candidates.append((p.stat().st_mtime, p, "单字"))
+        if not candidates:
+            self.curve_label.setText("训练曲线：尚无")
+            return
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        _mtime, metrics_path, kind = candidates[0]
         try:
-            data = json.loads(runs[0].read_text(encoding="utf-8"))
+            data = json.loads(metrics_path.read_text(encoding="utf-8"))
             hist = data.get("history") or []
         except Exception:
             self.curve_label.setText("训练曲线：读取失败")
             return
         if not hist:
+            self.curve_label.setText(f"训练曲线（{kind}）：无 history")
             return
-        lines = ["训练曲线（最近一次）:"]
+        lines = [f"训练曲线（{kind} · 最近一次）:"]
         for h in hist[-8:]:
             bar = "█" * max(1, int(float(h.get("val_acc", 0)) * 20))
             lines.append(
@@ -661,8 +943,40 @@ class TrainTabMixin:
         if not ok:
             QMessageBox.warning(self, "缺少依赖", msg)
             return
+        ckpt = latest_line_checkpoint(proj)
+        if not ckpt:
+            QMessageBox.warning(self, "提示", "请先训练行模型")
+            return
+        errors, warnings = line_export_quality_report(proj, ckpt)
+        force = hasattr(self, "chk_force_export") and self.chk_force_export.isChecked()
+        if errors and not force:
+            QMessageBox.warning(
+                self,
+                "行导出质量门禁未通过",
+                "\n".join(f"· {e}" for e in errors)
+                + "\n\n可勾选「强制导出」跳过，或先补行样本/再训练。",
+            )
+            return
+        if warnings or (errors and force):
+            detail = "\n".join(f"· {w}" for w in (errors + warnings))
+            reply = QMessageBox.question(
+                self,
+                "导出行模型确认",
+                f"{detail}\n\n仍要导出吗？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
         try:
-            out = export_line_onnx(proj)
+            out = export_line_onnx(proj, ckpt)
+            from game_digit_trainer.line_data import LINE_HEIGHT, LINE_MAX_WIDTH
+            import torch
+
+            meta = torch.load(ckpt, map_location="cpu", weights_only=False)
+            h = int(meta.get("input_height") or LINE_HEIGHT)
+            w = int(meta.get("input_max_width") or LINE_MAX_WIDTH)
+            verify_msg = verify_onnx_runtime(out, width=w, height=h)
         except Exception as exc:
             QMessageBox.critical(self, "导出行模型失败", f"{exc}\n{traceback.format_exc()}")
             return
@@ -671,9 +985,46 @@ class TrainTabMixin:
         QMessageBox.information(
             self,
             "已导出行模型",
-            f"{out.parent}\n\n可用「拷行模型到 Studio」写入 models/line/\n"
+            f"{out.parent}\n\n{verify_msg}\n\n可用「拷行模型到 Studio」写入 models/line/\n"
             "Lua: bot.recognizeDigits({{ roi=..., model='models/line/digits_line' }})",
         )
+
+    def _evaluate_line_samples(self) -> None:
+        proj = self._require_project()
+        if not proj:
+            return
+        ckpt = latest_line_checkpoint(proj)
+        if not ckpt:
+            QMessageBox.information(self, "提示", "请先训练行模型")
+            return
+        if count_line_labeled(proj) <= 0:
+            QMessageBox.information(self, "提示", "还没有已标行样本")
+            return
+        try:
+            report = evaluate_line_samples(proj, ckpt)
+            text = format_line_eval_report(report)
+        except Exception as exc:
+            QMessageBox.critical(self, "评估失败", str(exc))
+            return
+        self.train_log.append(text)
+        QMessageBox.information(self, "行样本评估", text)
+
+    def _show_coverage_suggestions(self) -> None:
+        proj = self._require_project()
+        if not proj:
+            return
+        tips = coverage_fill_suggestions(proj)
+        body = "\n".join(f"· {t}" for t in tips) if tips else "暂无建议"
+        go = QMessageBox.question(
+            self,
+            "补样建议",
+            body + "\n\n现在去 ① 截图页补样吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if go == QMessageBox.StandardButton.Yes:
+            self.tabs.setCurrentIndex(self.TAB_WORK)
+            self._status.showMessage("请框选整行 →「加入行待审」或开启定时刷样")
 
     def _open_export_dir(self) -> None:
         proj = self._require_project()

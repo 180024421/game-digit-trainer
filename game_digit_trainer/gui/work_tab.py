@@ -145,11 +145,18 @@ class WorkTabMixin:
             "优先用下方所选/最新行模型：蓝框整行一次出串；无行模型时回退单字切字识别。"
         )
         btn_preview.clicked.connect(self._preview_recognize)
+        btn_wrong_pending = QPushButton("读错→行待审")
+        btn_wrong_pending.setObjectName("dangerBtn")
+        btn_wrong_pending.setToolTip(
+            "当前蓝框识别不对时：把该行加入 ② 行待审；若金标已填会带过去方便确认"
+        )
+        btn_wrong_pending.clicked.connect(self._wrong_to_line_pending)
         btn_split = QPushButton("拆粘连")
         btn_split.setToolTip("点选绿框后拆开；未选中时自动拆最宽的框")
         btn_split.clicked.connect(self._split_selected_box)
         main_tools.addWidget(btn_auto)
         main_tools.addWidget(btn_preview)
+        main_tools.addWidget(btn_wrong_pending)
         main_tools.addWidget(btn_split)
         self.btn_verify_toggle = QPushButton("验模型 ▾")
         self.btn_verify_toggle.setCheckable(True)
@@ -266,6 +273,9 @@ class WorkTabMixin:
         self.preprocess_preview.setStyleSheet(
             "background:#0b1220; color:#94a3b8; border:1px solid #334155; border-radius:6px; font-size:11px;"
         )
+        self.preprocess_preview.setToolTip(
+            "仅给「自动切字」看效果。行模型识别用原始灰度，与这里二值预览无关。"
+        )
         prep_prev.addWidget(self.preprocess_preview)
         prep_prev.addStretch()
         more_l.addLayout(prep_prev)
@@ -292,6 +302,7 @@ class WorkTabMixin:
         btn_fix = QPushButton("修碎框")
         btn_fix.clicked.connect(self._autofix_boxes)
         btn_multi = QPushButton("多ROI刷样")
+        btn_multi.setToolTip("按 ROI 预设截图：默认写入「行待审」（主路径）；取消勾选则切单字")
         btn_multi.clicked.connect(self._multi_roi_sample)
         extra_tools.addWidget(btn_merge)
         extra_tools.addWidget(btn_fix)
@@ -301,14 +312,26 @@ class WorkTabMixin:
 
         auto_row = QHBoxLayout()
         self.chk_auto_roi = QCheckBox("定时刷样")
-        self.chk_auto_roi.setToolTip("按间隔对当前蓝框/ROI 预设自动截图切字")
+        self.chk_auto_roi.setToolTip("按间隔自动截图；默认写入行待审（与主路径一致）")
         self.auto_roi_spin = QSpinBox()
         self.auto_roi_spin.setRange(3, 120)
         self.auto_roi_spin.setValue(8)
         self.auto_roi_spin.setSuffix(" 秒")
         self.chk_auto_roi.toggled.connect(self._toggle_auto_roi_sample)
+        self.chk_auto_line_pending = QCheckBox("刷样→行待审")
+        self.chk_auto_line_pending.setChecked(True)
+        self.chk_auto_line_pending.setToolTip(
+            "勾选：定时/多ROI 写入行待审（推荐）。取消：走旧切字待审。"
+        )
+        self.chk_lowconf_line_pending = QCheckBox("低置信自动入队")
+        self.chk_lowconf_line_pending.setChecked(True)
+        self.chk_lowconf_line_pending.setToolTip(
+            "行识别置信低于阈值时，自动把当前蓝框加入行待审（并预填预测）"
+        )
         auto_row.addWidget(self.chk_auto_roi)
         auto_row.addWidget(self.auto_roi_spin)
+        auto_row.addWidget(self.chk_auto_line_pending)
+        auto_row.addWidget(self.chk_lowconf_line_pending)
         auto_row.addStretch()
         more_l.addLayout(auto_row)
 
@@ -1034,6 +1057,7 @@ class WorkTabMixin:
             self.preview_big.setText(text or "（空）")
         detail = " ".join(f"{display_label(l)}({c:.0%})" for l, c in parts)
         self.trial_result.setText(f"预览明细（单字路径）：{detail}")
+        self._last_recognize_text = text or ""
         if not silent:
             self._status.showMessage(f"识别预览：{text}")
 
@@ -1071,6 +1095,8 @@ class WorkTabMixin:
         detail = " ".join(f"{display_label(l)}({c:.0%})" for l, c in parts) or f"mean={mean_conf:.0%}"
         self.trial_result.setText(f"行模型明细：{detail}")
         self.import_canvas.set_predictions([])
+        self._last_recognize_text = text or ""
+        self._last_recognize_conf = float(mean_conf)
         if not silent:
             self._status.showMessage(f"行识别：{text} ← {line_ckpt.parent.name}/line_best.pt")
             thr = float(self.conf_spin.value()) if hasattr(self, "conf_spin") else 0.7
@@ -1085,11 +1111,35 @@ class WorkTabMixin:
                         expected="",
                         pred=text,
                     )
+                except Exception:
+                    pass
+                auto_q = (
+                    hasattr(self, "chk_lowconf_line_pending")
+                    and self.chk_lowconf_line_pending.isChecked()
+                )
+                if auto_q and region is not None:
+                    try:
+                        path = save_line_pending(
+                            proj,
+                            bgr,
+                            region,
+                            source_name=f"lowconf_{self._current_import.stem}",
+                            pred=text or "",
+                            conf=float(mean_conf),
+                            hint="",
+                        )
+                        self._status.showMessage(
+                            f"行识别：{text}（置信 {mean_conf:.0%} 偏低，已入行待审 {path.name}）"
+                        )
+                        self._update_header()
+                    except Exception:
+                        self._status.showMessage(
+                            f"行识别：{text}（置信 {mean_conf:.0%} 偏低，已记入难例）"
+                        )
+                else:
                     self._status.showMessage(
                         f"行识别：{text}（置信 {mean_conf:.0%} 偏低，已记入难例）"
                     )
-                except Exception:
-                    pass
         return True
 
     def _save_line_sample(self) -> None:
@@ -1149,6 +1199,52 @@ class WorkTabMixin:
         if reply == QMessageBox.StandardButton.Yes:
             self.tabs.setCurrentIndex(self.TAB_REVIEW)
             self._set_review_mode("line")
+
+    def _wrong_to_line_pending(self) -> None:
+        """识别出错：当前蓝框 → 行待审；金标框若有内容会预填到审核页。"""
+        proj = self._require_project()
+        if not proj:
+            return
+        if not self._current_import:
+            QMessageBox.information(self, "提示", "请先打开截图并框选数字")
+            return
+        region = self._region_for_line()
+        if region is None:
+            QMessageBox.information(self, "提示", "请先用「整行蓝框」圈住读错的那一行")
+            return
+        pred = getattr(self, "_last_recognize_text", "") or ""
+        hint = (self.gold_edit.text() or "").strip()
+        try:
+            bgr = load_bgr(self._current_import)
+            path = save_line_pending(
+                proj, bgr, region, source_name=f"wrong_{self._current_import.stem}"
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "加入失败", str(exc))
+            return
+        # 把正确金标（若已填）或空串记到会话，审核页可预填
+        self._pending_line_prefill = hint
+        self._update_header()
+        msg = f"已加入行待审：{path.name}"
+        if pred:
+            msg += f"\n模型误读为「{pred}」"
+        if hint:
+            msg += f"\n将预填金标「{hint}」"
+        else:
+            msg += "\n请到 ② 填写正确整串"
+        self._status.showMessage(msg.split("\n")[0])
+        go = QMessageBox.question(
+            self,
+            "读错已进待审",
+            msg + "\n\n现在去 ②「行待审」确认吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if go == QMessageBox.StandardButton.Yes:
+            self.tabs.setCurrentIndex(self.TAB_REVIEW)
+            self._set_review_mode("line")
+            if hint and hasattr(self, "line_label_edit"):
+                self.line_label_edit.setText(hint)
 
     def _set_canvas_interaction(self, mode: str) -> None:
         self.import_canvas.set_interaction_mode(mode)
@@ -1274,8 +1370,14 @@ class WorkTabMixin:
             self.chk_auto_roi.setChecked(False)
             return
         try:
+            use_line = (
+                hasattr(self, "chk_auto_line_pending") and self.chk_auto_line_pending.isChecked()
+            )
             if self.project.config.roi_presets:
-                self._multi_roi_sample()
+                self._multi_roi_sample(silent=True)
+            elif use_line:
+                n = self._auto_sample_line_pending_once()
+                self._status.showMessage(f"定时刷样：已写入行待审 {n} 张")
             else:
                 dest = self._capture_dest_dir()
                 if not dest:
@@ -1287,9 +1389,55 @@ class WorkTabMixin:
                         self.import_canvas.set_roi(self._last_roi)
                     self._auto_preview_boxes()
                     self._segment_current()
-            self._status.showMessage("定时刷样：已采集一轮")
+                self._status.showMessage("定时刷样：已采集一轮（切字）")
         except Exception as exc:
             self._status.showMessage(f"定时刷样失败: {exc}")
+
+    def _prefer_line_auto_sample(self) -> bool:
+        return hasattr(self, "chk_auto_line_pending") and self.chk_auto_line_pending.isChecked()
+
+    def _auto_sample_line_pending_once(self) -> int:
+        """截一帧（或用当前图）+ 当前蓝框/上次 ROI → 行待审。返回写入张数。"""
+        proj = self.project
+        if not proj:
+            return 0
+        dest = self._capture_dest_dir()
+        path = None
+        if dest:
+            try:
+                path = capture_adb(dest)
+                self._add_captured_path(path, apply_last_roi=bool(self._last_roi))
+            except Exception:
+                path = self._current_import
+        else:
+            path = self._current_import
+        if not path:
+            return 0
+        if self._last_roi and not self.import_canvas.roi():
+            self.import_canvas.set_roi(self._last_roi)
+        region = self._region_for_line()
+        if region is None and self._last_roi:
+            region = tuple(int(v) for v in self._last_roi)  # type: ignore[assignment]
+        if region is None:
+            return 0
+        bgr = load_bgr(path)
+        pred, conf = "", 0.0
+        line_ckpt = latest_line_checkpoint(proj)
+        if line_ckpt:
+            try:
+                pred, _parts, conf = predict_line_roi(proj, bgr, region, line_ckpt)
+            except Exception:
+                pred, conf = "", 0.0
+        out = save_line_pending(
+            proj,
+            bgr,
+            region,
+            source_name=f"auto_{Path(path).stem}",
+            pred=pred,
+            conf=float(conf),
+        )
+        self._update_header()
+        return 1 if out else 0
 
     def _split_selected_box(self) -> None:
         before = self.import_canvas.selected_box_index()
@@ -1322,13 +1470,14 @@ class WorkTabMixin:
             return
         self._add_captured_path(path, apply_last_roi=bool(self._last_roi))
 
-    def _multi_roi_sample(self) -> None:
+    def _multi_roi_sample(self, silent: bool = False) -> None:
         proj = self._require_project()
         if not proj:
             return
         presets = list(proj.config.roi_presets)
         if not presets:
-            QMessageBox.information(self, "提示", "请先在「更多」里保存多个 ROI 预设")
+            if not silent:
+                QMessageBox.information(self, "提示", "请先在「更多」里保存多个 ROI 预设")
             return
         dest = self._capture_dest_dir()
         if not dest:
@@ -1336,25 +1485,59 @@ class WorkTabMixin:
         try:
             path = capture_adb(dest)
         except Exception as exc:
-            QMessageBox.warning(
-                self,
-                "ADB 失败",
-                f"{exc}\n\n将使用当前图做多 ROI 切字（若已打开截图）",
-            )
+            if not silent:
+                QMessageBox.warning(
+                    self,
+                    "ADB 失败",
+                    f"{exc}\n\n将使用当前图做多 ROI（若已打开截图）",
+                )
             path = self._current_import
             if not path:
                 return
         self._add_captured_path(path)
         QApplication.processEvents()
-        total = 0
         try:
             bgr = load_bgr(path)
         except Exception as exc:
-            QMessageBox.critical(self, "读图失败", str(exc))
+            if not silent:
+                QMessageBox.critical(self, "读图失败", str(exc))
             return
+
+        if self._prefer_line_auto_sample():
+            total = 0
+            line_ckpt = latest_line_checkpoint(proj)
+            for preset in presets:
+                region = (preset.x, preset.y, preset.w, preset.h)
+                pred, conf = "", 0.0
+                if line_ckpt:
+                    try:
+                        pred, _parts, conf = predict_line_roi(proj, bgr, region, line_ckpt)
+                    except Exception:
+                        pred, conf = "", 0.0
+                try:
+                    save_line_pending(
+                        proj,
+                        bgr,
+                        region,
+                        source_name=f"roi_{preset.name}_{Path(path).stem}",
+                        pred=pred,
+                        conf=float(conf),
+                    )
+                    total += 1
+                except Exception:
+                    continue
+            self._update_header()
+            self._refresh_project_info()
+            msg = f"多 ROI 刷样：已写入行待审 {total} 张"
+            self._status.showMessage(msg)
+            if not silent:
+                self.tabs.setCurrentIndex(self.TAB_REVIEW)
+                self._set_review_mode("line")
+                QMessageBox.information(self, "完成", msg + "\n请到 ②「行待审」确认金标。")
+            return
+
+        total = 0
         for preset in presets:
-            boxes = []
-            # auto segment inside each ROI
             try:
                 _, crops, _ = segment_image(
                     path,
@@ -1363,7 +1546,6 @@ class WorkTabMixin:
                     max_gap=self.gap_spin.value(),
                 )
                 if crops:
-                    # convert to full-image boxes
                     boxes = [(c.x + preset.x, c.y + preset.y, c.w, c.h) for c in crops]
                 else:
                     boxes = [(preset.x, preset.y, preset.w, preset.h)]
@@ -1374,7 +1556,8 @@ class WorkTabMixin:
                 continue
         self._reload_pending()
         self._refresh_project_info()
-        self.tabs.setCurrentIndex(self.TAB_REVIEW)
+        if not silent:
+            self.tabs.setCurrentIndex(self.TAB_REVIEW)
         self._status.showMessage(f"多 ROI 刷样完成：共切出 {total} 个字")
 
     def _gold_compare_reflow(self) -> None:
@@ -1385,6 +1568,46 @@ class WorkTabMixin:
         if not raw:
             QMessageBox.information(self, "提示", "请先填写金标，例如 1234万")
             return
+        line_ckpt = latest_line_checkpoint(proj)
+        region = self._region_for_line()
+        if line_ckpt and region is not None and self._current_import:
+            if not getattr(self, "_last_recognize_text", None):
+                self._preview_recognize()
+            pred = getattr(self, "_last_recognize_text", "") or ""
+            if pred == raw:
+                QMessageBox.information(self, "对比通过", f"与金标一致：{raw}")
+                return
+            conf = float(getattr(self, "_last_recognize_conf", 0.0) or 0.0)
+            try:
+                bgr = load_bgr(self._current_import)
+                path = save_line_pending(
+                    proj,
+                    bgr,
+                    region,
+                    source_name=f"mismatch_{self._current_import.stem}",
+                    pred=pred,
+                    conf=conf,
+                    hint=raw,
+                )
+            except Exception as exc:
+                QMessageBox.warning(self, "加入失败", str(exc))
+                return
+            self._pending_line_prefill = raw
+            self._update_header()
+            go = QMessageBox.question(
+                self,
+                "金标不符",
+                f"模型「{pred}」≠ 金标「{raw}」\n已加入行待审：{path.name}\n\n现在去确认吗？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if go == QMessageBox.StandardButton.Yes:
+                self.tabs.setCurrentIndex(self.TAB_REVIEW)
+                self._set_review_mode("line")
+                if hasattr(self, "line_label_edit"):
+                    self.line_label_edit.setText(raw)
+            return
+
         preds = self.import_canvas.predictions()
         if not preds:
             self._preview_recognize()

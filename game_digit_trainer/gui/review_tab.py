@@ -149,9 +149,14 @@ class ReviewTabMixin:
         right.addWidget(self.chk_sort_conf)
 
         btn_prelabel = QPushButton('全部预标排序')
-        btn_prelabel.setToolTip('用当前模型给全部待审打分并按置信度排序')
+        btn_prelabel.setToolTip('单字待审：用单字模型；行待审：用行模型预填并按置信度排序')
         btn_prelabel.clicked.connect(self._prelabel_all_pending)
         right.addWidget(btn_prelabel)
+
+        self.btn_line_batch = QPushButton('批量确认高置信行')
+        self.btn_line_batch.setToolTip('行待审：把置信≥阈值且有预标的条目直接确认入库')
+        self.btn_line_batch.clicked.connect(self._batch_confirm_line_pending)
+        right.addWidget(self.btn_line_batch)
 
         btn_jump_last = QPushButton('查看刚标的那张')
         btn_jump_last.setToolTip('跳到最近一次标注的样本，方便立刻改错')
@@ -298,6 +303,11 @@ class ReviewTabMixin:
             b.style().polish(b)
         self._sync_line_review_ui()
         self._reload_review_lists()
+        prefill = getattr(self, "_pending_line_prefill", None)
+        if self._review_mode == "line" and prefill and hasattr(self, "line_label_edit"):
+            self.line_label_edit.setText(str(prefill))
+            self.line_label_edit.selectAll()
+            self._pending_line_prefill = None
 
     def _sync_line_review_ui(self) -> None:
         is_line = self._review_mode == "line"
@@ -398,6 +408,9 @@ class ReviewTabMixin:
                 return
             for p in files:
                 p.unlink(missing_ok=True)
+            from game_digit_trainer.line_data import save_line_pending_hints
+
+            save_line_pending_hints(proj, {})
             self._line_idx = 0
             self._status.showMessage(f"已清空行待审 {len(files)} 个")
         self._reload_review_lists()
@@ -418,6 +431,7 @@ class ReviewTabMixin:
             items = [(p, "行") for p in self._line_pending]
         else:
             items = [(p, lab) for p, lab in self._labeled]
+        hints = load_line_pending_hints(self.project) if self.project else {}
         for i, (path, lab) in enumerate(items):
             if lab is None:
                 score = self._pending_scores.get(path.name)
@@ -427,6 +441,16 @@ class ReviewTabMixin:
                     title = f"{i + 1}"
             elif str(lab).startswith("难:"):
                 title = str(lab)[2:6]
+            elif lab == "行":
+                h = hints.get(path.name) or {}
+                pred = str(h.get("pred") or h.get("hint") or "")
+                conf = float(h.get("conf") or 0)
+                if pred:
+                    title = f"{pred[:6]}{('…' if len(pred) > 6 else '')}"
+                    if conf > 0:
+                        title = f"{title} {conf:.0%}"
+                else:
+                    title = f"行{i + 1}"
             else:
                 title = f"{display_label(lab)}"
             item = QListWidgetItem(title)
@@ -434,6 +458,8 @@ class ReviewTabMixin:
             tip = path.name if lab is None else f"{lab} · {path.name}"
             if lab is None and path.name in self._pending_scores:
                 tip += f" · pred {self._pending_scores[path.name]}"
+            if lab == "行" and path.name in hints:
+                tip += f" · {hints[path.name]}"
             item.setToolTip(tip)
             raw = np.fromfile(str(path), dtype=np.uint8)
             img = cv2.imdecode(raw, cv2.IMREAD_GRAYSCALE)
@@ -458,6 +484,11 @@ class ReviewTabMixin:
             self._hard_idx = min(self._hard_idx, len(self._hard) - 1)
             self.pending_list.blockSignals(True)
             self.pending_list.setCurrentRow(self._hard_idx)
+            self.pending_list.blockSignals(False)
+        elif self._review_mode == "line" and self._line_pending:
+            self._line_idx = min(self._line_idx, len(self._line_pending) - 1)
+            self.pending_list.blockSignals(True)
+            self.pending_list.setCurrentRow(self._line_idx)
             self.pending_list.blockSignals(False)
 
     def _on_gallery_selected(self, row: int) -> None:
@@ -589,21 +620,37 @@ class ReviewTabMixin:
             self.btn_confirm.setEnabled(False)
             if hasattr(self, "line_label_edit"):
                 self.line_label_edit.setFocus()
-                # 可选：用行模型预填
+                # 优先 hint → 会话预填 → 行模型预测
+                prefill = ""
+                conf = 0.0
                 if self.project:
+                    h = get_line_pending_hint(self.project, path.name)
+                    prefill = str(h.get("hint") or h.get("pred") or "")
+                    conf = float(h.get("conf") or 0)
+                if not prefill:
+                    prefill = getattr(self, "_pending_line_prefill", "") or ""
+                if not prefill and self.project:
                     line_ckpt = latest_line_checkpoint(self.project)
-                    if line_ckpt and not self.line_label_edit.text().strip():
+                    if line_ckpt:
                         try:
-                            from game_digit_trainer.predict_line import predict_line_gray
-                            from game_digit_trainer.predict_line import load_line_checkpoint
-
                             model, classes, _h, max_w = load_line_checkpoint(line_ckpt)
-                            text, _parts, _c = predict_line_gray(model, classes, img, max_w=max_w)
+                            text, _parts, conf = predict_line_gray(
+                                model, classes, img, max_w=max_w
+                            )
                             if text:
-                                self.line_label_edit.setText(text)
-                                self.line_label_edit.selectAll()
+                                prefill = text
+                                set_line_pending_hint(
+                                    self.project, path.name, pred=text, conf=float(conf)
+                                )
                         except Exception:
                             pass
+                if prefill and not self.line_label_edit.text().strip():
+                    self.line_label_edit.setText(prefill)
+                    self.line_label_edit.selectAll()
+                if prefill:
+                    self.pred_label_ui.setText(
+                        f"预填「{prefill}」" + (f"（{conf:.0%}）" if conf > 0 else "")
+                    )
         else:
             lab = self._current_labeled_class() or "?"
             self.review_meta.setText(
@@ -1046,11 +1093,22 @@ class ReviewTabMixin:
         proj = self._require_project()
         if not proj:
             return
-        ckpt = latest_checkpoint(proj)
-        if not ckpt:
-            QMessageBox.information(self, "提示", "请先训练出模型再预标")
+        if self._review_mode == "line":
+            self._prelabel_line_pending()
             return
         paths = proj.pending_files()
+        if not paths and list_line_pending(proj):
+            self._set_review_mode("line")
+            self._prelabel_line_pending()
+            return
+        ckpt = latest_checkpoint(proj)
+        if not ckpt:
+            if latest_line_checkpoint(proj) and list_line_pending(proj):
+                self._set_review_mode("line")
+                self._prelabel_line_pending()
+                return
+            QMessageBox.information(self, "提示", "请先训练出模型再预标")
+            return
         if not paths:
             QMessageBox.information(self, "提示", "没有待审样本")
             return
@@ -1068,6 +1126,77 @@ class ReviewTabMixin:
         self._set_review_mode("pending")
         self._reload_review_lists()
         self._status.showMessage(f"已预标 {len(scored)} 张，按置信度升序（难的在前）")
+
+    def _prelabel_line_pending(self) -> None:
+        proj = self._require_project()
+        if not proj:
+            return
+        ckpt = latest_line_checkpoint(proj)
+        if not ckpt:
+            QMessageBox.information(self, "提示", "请先训练行模型再预标")
+            return
+        paths = list_line_pending(proj)
+        if not paths:
+            QMessageBox.information(self, "提示", "没有行待审")
+            return
+        try:
+            model, classes, _h, max_w = load_line_checkpoint(ckpt)
+        except Exception as exc:
+            QMessageBox.critical(self, "加载失败", str(exc))
+            return
+        scored: list[tuple[Path, str, float]] = []
+        for p in paths:
+            raw = np.fromfile(str(p), dtype=np.uint8)
+            img = cv2.imdecode(raw, cv2.IMREAD_GRAYSCALE)
+            if img is None:
+                continue
+            try:
+                text, _parts, conf = predict_line_gray(model, classes, img, max_w=max_w)
+            except Exception:
+                text, conf = "", 0.0
+            h = get_line_pending_hint(proj, p.name)
+            hint = str(h.get("hint") or "")
+            set_line_pending_hint(proj, p.name, pred=text or "", conf=float(conf), hint=hint)
+            scored.append((p, text or "", float(conf)))
+        scored.sort(key=lambda x: x[2])  # 低置信在前
+        self._line_pending = [p for p, _t, _c in scored]
+        self._line_idx = 0
+        self._set_review_mode("line")
+        self._reload_review_lists()
+        self._show_current()
+        self._status.showMessage(f"行待审已预标 {len(scored)} 张，按置信度升序（难的在前）")
+
+    def _batch_confirm_line_pending(self) -> None:
+        proj = self._require_project()
+        if not proj:
+            return
+        thr = float(self.conf_spin.value()) if hasattr(self, "conf_spin") else 0.85
+        paths = list_line_pending(proj)
+        if not paths:
+            QMessageBox.information(self, "提示", "没有行待审")
+            return
+        confirmed = 0
+        for p in list(paths):
+            h = get_line_pending_hint(proj, p.name)
+            text = str(h.get("hint") or h.get("pred") or "").strip()
+            conf = float(h.get("conf") or 0)
+            if not text or conf < thr:
+                continue
+            try:
+                confirm_line_pending(proj, p, text)
+                confirmed += 1
+            except Exception:
+                continue
+        self._line_pending = list_line_pending(proj)
+        self._line_idx = 0
+        self._reload_review_lists()
+        self._refresh_project_info()
+        self._show_current()
+        QMessageBox.information(
+            self,
+            "批量确认",
+            f"已确认 {confirmed} 条（置信≥{thr:.0%}）。\n剩余 {len(self._line_pending)} 条请人工核对。",
+        )
 
     def _jump_to_last_labeled(self) -> None:
         if not self.project or not self._last_labeled_path:
