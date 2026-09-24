@@ -27,6 +27,9 @@ import numpy as np
 
 FIXED_ROI_A = (100, 10, 200, 40)
 FIXED_ROI_B = (280, 5, 240, 45)
+# 小于该尺寸视为「已裁好的标题条」，不再套全屏 ROI
+SMALL_CROP_MAX_H = 96
+SMALL_CROP_MAX_W = 480
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 18765
 
@@ -34,7 +37,27 @@ _REC = None
 
 
 def _norm(s: str) -> str:
-    return re.sub(r"\s+", "", (s or "").replace("　", "").strip())
+    """只保留汉字，去掉星号/符号/空格等 OCR 噪声。"""
+    s = (s or "").replace("　", "")
+    chars = re.findall(r"[\u4e00-\u9fff]+", s)
+    return "".join(chars)
+
+
+def _is_small_crop(img: np.ndarray) -> bool:
+    h, w = img.shape[:2]
+    return h <= SMALL_CROP_MAX_H or w <= SMALL_CROP_MAX_W
+
+
+def _resolve_roi(
+    img: np.ndarray,
+    roi: tuple[int, int, int, int] | None,
+    *,
+    force_full: bool = False,
+) -> tuple[int, int, int, int]:
+    h, w = img.shape[:2]
+    if force_full or roi is None or _is_small_crop(img):
+        return (0, 0, w, h)
+    return roi
 
 
 def _get_rec():
@@ -75,18 +98,32 @@ def _crop(img: np.ndarray, xywh: tuple[int, int, int, int]) -> np.ndarray:
 
 
 def _prep_rec_img(bgr: np.ndarray) -> np.ndarray:
+    """小图加边距并放大，避免贴边裁切导致漏字。"""
+    pad = 8
+    bgr = cv2.copyMakeBorder(bgr, pad, pad, pad, pad, cv2.BORDER_REPLICATE)
     h, w = bgr.shape[:2]
-    if max(h, w) < 120:
+    # 标题条高度通常很小，放大到约 64px 高再识别更稳
+    if h < 64:
+        scale = 64.0 / h
+        bgr = cv2.resize(
+            bgr,
+            (max(8, int(round(w * scale))), 64),
+            interpolation=cv2.INTER_CUBIC,
+        )
+    elif max(h, w) < 160:
         bgr = cv2.resize(bgr, (w * 2, h * 2), interpolation=cv2.INTER_CUBIC)
     return bgr
 
 
-def _parse_xywh(s: str, default: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
-    if not (s or "").strip():
+def _parse_xywh(s: str, default: tuple[int, int, int, int] | None) -> tuple[int, int, int, int] | None:
+    raw = (s or "").strip().lower()
+    if not raw:
         return default
-    parts = [int(float(p.strip())) for p in s.replace(" ", "").split(",")]
+    if raw in {"full", "0", "none", "auto"}:
+        return None
+    parts = [int(float(p.strip())) for p in raw.replace(" ", "").split(",")]
     if len(parts) != 4:
-        raise SystemExit(f"ROI 需 x,y,w,h，收到: {s}")
+        raise SystemExit(f"ROI 需 x,y,w,h 或 full，收到: {s}")
     return parts[0], parts[1], parts[2], parts[3]
 
 
@@ -100,13 +137,23 @@ def _decide(text_a: str, text_b: str, keyword: str) -> tuple[bool, str]:
             else f"关键词未双边命中（关键词「{kw}」，实际 A={text_a!r} B={text_b!r}）"
         )
         return matched, reason
-    matched = bool(text_a and text_b and (text_a == text_b or text_a in text_b or text_b in text_a))
-    reason = (
-        f"两边文本一致：{text_a!r}"
-        if matched
-        else f"两边文本不一致：A={text_a!r} B={text_b!r}"
-    )
-    return matched, reason
+    if not text_a or not text_b:
+        return False, f"两边文本不一致：A={text_a!r} B={text_b!r}"
+    if text_a == text_b or text_a in text_b or text_b in text_a:
+        return True, f"两边文本一致：{text_a!r} / {text_b!r}"
+    # 较长公共子串（防星号/漏字导致不完全相等）
+    shorter, longer = (text_a, text_b) if len(text_a) <= len(text_b) else (text_b, text_a)
+    if len(shorter) >= 3 and shorter in longer:
+        return True, f"两边核心一致：{shorter!r}"
+    best = 0
+    for i in range(len(shorter)):
+        for j in range(i + 3, len(shorter) + 1):
+            sub = shorter[i:j]
+            if sub in longer:
+                best = max(best, len(sub))
+    if best >= max(3, min(len(text_a), len(text_b)) - 1):
+        return True, f"两边近似匹配（公共 {best} 字）：A={text_a!r} B={text_b!r}"
+    return False, f"两边文本不一致：A={text_a!r} B={text_b!r}"
 
 
 def match_titles(
@@ -114,12 +161,17 @@ def match_titles(
     path_b: Path,
     *,
     keyword: str = "",
-    roi_a: tuple[int, int, int, int] = FIXED_ROI_A,
-    roi_b: tuple[int, int, int, int] = FIXED_ROI_B,
+    roi_a: tuple[int, int, int, int] | None = FIXED_ROI_A,
+    roi_b: tuple[int, int, int, int] | None = FIXED_ROI_B,
+    force_full: bool = False,
 ) -> dict[str, Any]:
     t_all = time.perf_counter()
-    crop_a = _prep_rec_img(_crop(_read_bgr(path_a), roi_a))
-    crop_b = _prep_rec_img(_crop(_read_bgr(path_b), roi_b))
+    img_a = _read_bgr(path_a)
+    img_b = _read_bgr(path_b)
+    used_a = _resolve_roi(img_a, roi_a, force_full=force_full)
+    used_b = _resolve_roi(img_b, roi_b, force_full=force_full)
+    crop_a = _prep_rec_img(_crop(img_a, used_a))
+    crop_b = _prep_rec_img(_crop(img_b, used_b))
 
     t_load = time.perf_counter()
     rec = _get_rec()
@@ -142,8 +194,10 @@ def match_titles(
         "text_b": text_b,
         "conf_a": round(conf_a, 4),
         "conf_b": round(conf_b, 4),
-        "roi_a": list(roi_a),
-        "roi_b": list(roi_b),
+        "roi_a": list(used_a),
+        "roi_b": list(used_b),
+        "full_a": used_a == (0, 0, img_a.shape[1], img_a.shape[0]),
+        "full_b": used_b == (0, 0, img_b.shape[1], img_b.shape[0]),
         "load_ms": round(load_ms, 1),
         "ocr_ms": round(ocr_ms, 1),
         "total_ms": round((time.perf_counter() - t_all) * 1000, 1),
@@ -164,12 +218,12 @@ def match_via_server(
     path_b: Path,
     *,
     keyword: str = "",
-    roi_a: tuple[int, int, int, int] = FIXED_ROI_A,
-    roi_b: tuple[int, int, int, int] = FIXED_ROI_B,
+    roi_a: tuple[int, int, int, int] | None = FIXED_ROI_A,
+    roi_b: tuple[int, int, int, int] | None = FIXED_ROI_B,
+    force_full: bool = False,
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
 ) -> dict[str, Any]:
-    import urllib.error
     import urllib.request
 
     payload = json.dumps(
@@ -177,8 +231,9 @@ def match_via_server(
             "a": str(Path(path_a).resolve()),
             "b": str(Path(path_b).resolve()),
             "keyword": keyword,
-            "roi_a": list(roi_a),
-            "roi_b": list(roi_b),
+            "roi_a": list(roi_a) if roi_a else None,
+            "roi_b": list(roi_b) if roi_b else None,
+            "force_full": force_full,
         },
         ensure_ascii=False,
     ).encode("utf-8")
@@ -219,12 +274,20 @@ class _Handler(BaseHTTPRequestHandler):
         raw = self.rfile.read(n)
         try:
             req = json.loads(raw.decode("utf-8"))
+
+            def _roi(key: str, default):
+                v = req.get(key, default)
+                if v is None:
+                    return None
+                return tuple(v)
+
             rep = match_titles(
                 Path(req["a"]),
                 Path(req["b"]),
                 keyword=str(req.get("keyword") or ""),
-                roi_a=tuple(req.get("roi_a") or FIXED_ROI_A),  # type: ignore[arg-type]
-                roi_b=tuple(req.get("roi_b") or FIXED_ROI_B),  # type: ignore[arg-type]
+                roi_a=_roi("roi_a", FIXED_ROI_A),
+                roi_b=_roi("roi_b", FIXED_ROI_B),
+                force_full=bool(req.get("force_full")),
             )
             body = json.dumps(rep, ensure_ascii=False).encode("utf-8")
             self.send_response(200)
@@ -279,8 +342,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("image_a", type=Path, nargs="?")
     ap.add_argument("image_b", type=Path, nargs="?")
     ap.add_argument("--keyword", default="", help="可选关键词；默认只比 A/B 文本是否一致")
-    ap.add_argument("--roi-a", default="")
-    ap.add_argument("--roi-b", default="")
+    ap.add_argument("--roi-a", default="", help="像素 x,y,w,h；小图可写 full；默认自动")
+    ap.add_argument("--roi-b", default="", help="像素 x,y,w,h；小图可写 full；默认自动")
+    ap.add_argument("--full", action="store_true", help="强制整图识别（适合已裁好的标题条）")
     ap.add_argument("--serve", action="store_true", help="启动常驻服务（推荐）")
     ap.add_argument("--port", type=int, default=DEFAULT_PORT)
     ap.add_argument("--local", action="store_true", help="强制本地跑，不连常驻服务")
@@ -296,8 +360,9 @@ def main(argv: list[str] | None = None) -> int:
         ap.print_help()
         return 2
 
-    roi_a = _parse_xywh(args.roi_a, FIXED_ROI_A)
-    roi_b = _parse_xywh(args.roi_b, FIXED_ROI_B)
+    roi_a = _parse_xywh(args.roi_a, None if args.full else FIXED_ROI_A)
+    roi_b = _parse_xywh(args.roi_b, None if args.full else FIXED_ROI_B)
+    force_full = bool(args.full)
 
     if args.debug:
         debug = Path("_match_debug")
@@ -306,7 +371,9 @@ def main(argv: list[str] | None = None) -> int:
             (args.image_a, roi_a, "crop_a.png"),
             (args.image_b, roi_b, "crop_b.png"),
         ):
-            crop = _crop(_read_bgr(path), roi)
+            img = _read_bgr(path)
+            used = _resolve_roi(img, roi, force_full=force_full)
+            crop = _crop(img, used)
             cv2.imencode(".png", crop)[1].tofile(str(debug / name))
 
     use_server = (not args.local) and _server_alive(port=args.port)
@@ -318,6 +385,7 @@ def main(argv: list[str] | None = None) -> int:
                 keyword=args.keyword,
                 roi_a=roi_a,
                 roi_b=roi_b,
+                force_full=force_full,
                 port=args.port,
             )
         except Exception as exc:
@@ -328,6 +396,7 @@ def main(argv: list[str] | None = None) -> int:
                 keyword=args.keyword,
                 roi_a=roi_a,
                 roi_b=roi_b,
+                force_full=force_full,
             )
     else:
         rep = match_titles(
@@ -336,6 +405,7 @@ def main(argv: list[str] | None = None) -> int:
             keyword=args.keyword,
             roi_a=roi_a,
             roi_b=roi_b,
+            force_full=force_full,
         )
         if not args.local:
             print(
